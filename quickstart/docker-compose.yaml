@@ -1,0 +1,21 @@
+services:
+  seq-db-proxy:
+    image: ghcr.io/ozontech/seq-db:latest
+    volumes:
+      - "./config.quickstart.yaml:/seq-db/config.yaml"
+      - "./mappings.yaml:/seq-db/mappings.yaml"
+    ports:
+      - "9002:9002" # Default HTTP port
+      - "9004:9004" # Default gRPC port
+      - "9200:9200" # Default debug port
+    command: --mode proxy --config=config.yaml
+    depends_on:
+      - seq-db-store
+
+  seq-db-store:
+    image: ghcr.io/ozontech/seq-db:latest
+    volumes:
+      - "./config.quickstart.yaml:/seq-db/config.yaml"
+      - "./data/:/seq-db/data/"
+      - "./mappings.yaml:/seq-db/mappings.yaml"
+    command: --mode store --config=config.yaml

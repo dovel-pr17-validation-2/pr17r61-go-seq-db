@@ -1,0 +1,542 @@
+package processor
+
+import (
+	"cmp"
+	"fmt"
+	"math"
+	"math/rand"
+	"reflect"
+	"slices"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ozontech/seq-db/consts"
+	"github.com/ozontech/seq-db/node"
+	"github.com/ozontech/seq-db/seq"
+)
+
+func TestSingleSourceCountAggregator(t *testing.T) {
+	// For now input for this test is incorrect since we support
+	// aggregations only for `keyword` index type.
+	// Will be fixed in #310.
+	searchDocs := []uint32{2, 3, 5, 8, 10, 12, 15}
+	sources := [][]uint32{
+		{2, 3, 5, 8, 10, 12},
+		{1, 4, 6, 9, 11, 13},
+		{1, 2, 4, 5, 8, 11, 12},
+	}
+
+	source := node.BuildORTreeAgg(node.MakeStaticNodes(sources))
+	iter := NewSourcedNodeIterator(source, nil, make([]uint32, len(sources)), "", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+	agg := NewSingleSourceCountAggregator(iter, provideExtractTimeFunc(nil, nil, 0), false)
+
+	lids := make([]node.LID, len(searchDocs))
+	for i, id := range searchDocs {
+		lids[i] = node.NewAscLID(id)
+	}
+	if err := agg.Next(lids); err != nil {
+		t.Fatal(err)
+	}
+
+	counter := agg.counter.(*plainSourceCounter)
+	require.Len(t, counter.countBySource.chunks, 1)
+	require.NotNil(t, counter.countBySource.chunks[0])
+	assert.Equal(t, [sourceChunkSize]uint64{2, 0, 4}, *counter.countBySource.chunks[0])
+	assert.Equal(t, 2, iter.UniqueSources())
+
+	assert.Equal(t, int64(1), agg.counter.notExists())
+}
+
+func TestSingleSourceCountAggregatorWithInterval(t *testing.T) {
+	// For now input for this test is incorrect since we support
+	// aggregations only for `keyword` index type.
+	// Will be fixed in #310.
+	searchDocs := []uint32{2, 3, 5, 8, 10, 12, 15}
+	sources := [][]uint32{
+		{2, 3, 5, 8, 10, 12},
+		{1, 4, 6, 9, 11, 13},
+		{1, 2, 4, 5, 8, 11, 12},
+	}
+
+	source := node.BuildORTreeAgg(node.MakeStaticNodes(sources))
+	iter := NewSourcedNodeIterator(source, nil, make([]uint32, len(sources)), "", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+
+	agg := NewSingleSourceCountAggregator(iter, func(lids []node.LID, dst []seq.MID) []seq.MID {
+		for _, lid := range lids {
+			dst = append(dst, seq.MID(lid.ToSeqLID())%3)
+		}
+		return dst
+	}, true)
+
+	lids := make([]node.LID, len(searchDocs))
+	for i, id := range searchDocs {
+		lids[i] = node.NewAscLID(id)
+	}
+	if err := agg.Next(lids); err != nil {
+		t.Fatal(err)
+	}
+
+	counter := agg.counter.(*tsSourceCounter)
+	got := make(map[AggBin[int]]uint32)
+	for source, bin := range counter.counts.all() {
+		got[AggBin[int]{Source: int(source), MID: bin.MID}] = bin.count
+	}
+	assert.Equal(t, map[AggBin[int]]uint32{
+		{Source: 0, MID: 0}: 1,
+		{Source: 2, MID: 0}: 1,
+		{Source: 0, MID: 1}: 1,
+		{Source: 2, MID: 2}: 3,
+	}, got)
+
+	assert.Equal(t, int64(1), agg.counter.notExists())
+}
+
+const benchRandSeed int64 = 1
+
+func Generate(r *rand.Rand, n int) ([]uint32, uint32) {
+	v := make([]uint32, n)
+	last := uint32(1)
+	for i := range v {
+		v[i] = last
+		last += uint32(1 + r.Intn(5))
+	}
+	return v, last
+}
+
+func BenchmarkAggDeep(b *testing.B) {
+	sizes := []int{1_000, 10_000, 1_000_000}
+
+	for _, s := range sizes {
+		b.Run(fmt.Sprintf("size=%d", s), func(b *testing.B) {
+			r := rand.New(rand.NewSource(benchRandSeed))
+			v, _ := Generate(r, s)
+			src := node.NewSourcedNodeWrapper(node.NewStatic(v, true), 0)
+			iter := NewSourcedNodeIterator(src, nil, make([]uint32, 1), "", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+			n := NewSingleSourceCountAggregator(iter, provideExtractTimeFunc(nil, nil, 0), false)
+			vals, _ := Generate(r, s)
+			lids := make([]node.LID, len(vals))
+			for i, v := range vals {
+				lids[i] = node.NewAscLID(v)
+			}
+
+			for b.Loop() {
+				if err := n.Next(lids); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkAggWide(b *testing.B) {
+	sizes := []int{1_000, 10_000, 1_000_000}
+
+	for _, s := range sizes {
+		b.Run(fmt.Sprintf("size=%d", s), func(b *testing.B) {
+			r := rand.New(rand.NewSource(benchRandSeed))
+			v, _ := Generate(r, s)
+
+			factor := int(math.Sqrt(float64(s)))
+			wide := make([][]uint32, s/factor)
+			for i := range wide {
+				for range factor {
+					wide[i] = append(wide[i], v[r.Intn(s)])
+				}
+				slices.Sort(wide[i])
+			}
+
+			source := node.BuildORTreeAgg(node.MakeStaticNodes(wide))
+
+			iter := NewSourcedNodeIterator(source, nil, make([]uint32, len(wide)), "", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+			n := NewSingleSourceCountAggregator(iter, provideExtractTimeFunc(nil, nil, 0), false)
+			vals, _ := Generate(r, s)
+			lids := make([]node.LID, len(vals))
+			for i, v := range vals {
+				lids[i] = node.NewAscLID(v)
+			}
+
+			for b.Loop() {
+				if err := n.Next(lids); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type MockTokenIndex struct {
+	tokenIndex // embed to implement TokenIndex interface and override only needed methods
+}
+
+func (m *MockTokenIndex) GetValByTID(tid uint32, _ string) []byte {
+	return []byte(strconv.Itoa(int(tid)))
+}
+
+func (m *MockTokenIndex) GetFreqsByTIDs(tids []uint32, _ string) []uint32 {
+	return make([]uint32, len(tids))
+}
+
+type IDSourcePair struct {
+	LID    node.LID
+	Source uint32
+}
+
+type MockNode struct {
+	Pairs []IDSourcePair
+}
+
+// String implements node.Sourced
+func (m *MockNode) String() string {
+	return reflect.TypeOf(m).String()
+}
+
+func (m *MockNode) NextSourced() (node.LID, uint32) {
+	if len(m.Pairs) == 0 {
+		return node.NullLID(), 0
+	}
+	first := m.Pairs[0]
+	m.Pairs = m.Pairs[1:]
+	return first.LID, first.Source
+}
+
+func (m *MockNode) NextSourcedGeq(minLID node.LID) (node.LID, uint32) {
+	for len(m.Pairs) > 0 && m.Pairs[0].LID.Less(minLID) {
+		m.Pairs = m.Pairs[1:]
+	}
+	if len(m.Pairs) == 0 {
+		return node.NullLID(), 0
+	}
+	first := m.Pairs[0]
+	m.Pairs = m.Pairs[1:]
+	return first.LID, first.Source
+}
+
+func (*MockNode) Release() {}
+
+func TestTwoSourceAggregator(t *testing.T) {
+	r := require.New(t)
+
+	// Mock data provider and sources.
+	dp := &MockTokenIndex{}
+	field := &MockNode{
+		Pairs: []IDSourcePair{
+			{LID: node.NewAscLID(1), Source: 0},
+			{LID: node.NewAscLID(2), Source: 1},
+		},
+	}
+	groupBy := &MockNode{
+		Pairs: []IDSourcePair{
+			{LID: node.NewAscLID(1), Source: 0},
+			{LID: node.NewAscLID(2), Source: 1},
+		},
+	}
+
+	fieldTIDs := []uint32{42, 73}
+	groupByTIDs := []uint32{1, 2}
+	groupIterator := NewSourcedNodeIterator(groupBy, dp, groupByTIDs, "group_by", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+	fieldIterator := NewSourcedNodeIterator(field, dp, fieldTIDs, "field", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+	limits := AggLimits{}
+	aggregator := NewGroupAndFieldAggregator(
+		fieldIterator, groupIterator, provideExtractTimeFunc(nil, nil, 0), true, false, limits,
+	)
+
+	// Call Next for two data points.
+	r.NoError(aggregator.Next([]node.LID{node.NewAscLID(1), node.NewAscLID(2)}))
+
+	// Verify countBySource map.
+	expectedCountBySource := map[twoSources]int64{
+		{GroupBySource: 0, FieldSource: 0}: 1,
+		{GroupBySource: 1, FieldSource: 1}: 1,
+	}
+
+	for source, count := range expectedCountBySource {
+		r.Equal(count, aggregator.countBySource[AggBin[twoSources]{
+			Source: source,
+		}])
+	}
+
+	agg, err := aggregator.Aggregate()
+	r.NoError(err)
+
+	wantBuckets := []seq.AggregationBucket{
+		{
+			Name:  "2",
+			Value: 73,
+		},
+		{
+			Name:  "1",
+			Value: 42,
+		},
+	}
+
+	got := agg.Aggregate(seq.AggregateArgs{
+		Func: seq.AggFuncMax,
+	})
+
+	r.Equal(wantBuckets, got.Buckets)
+}
+
+func TestSingleTreeCountAggregator(t *testing.T) {
+	r := require.New(t)
+	dp := &MockTokenIndex{}
+	field := &MockNode{
+		Pairs: []IDSourcePair{
+			{LID: node.NewAscLID(1), Source: 0},
+		},
+	}
+
+	iter := NewSourcedNodeIterator(field, dp, []uint32{0}, "field", iteratorLimit{limit: 0, err: consts.ErrTooManyGroupTokens})
+	aggregator := NewSingleSourceCountAggregator(iter, provideExtractTimeFunc(nil, nil, 0), false)
+
+	r.NoError(aggregator.Next([]node.LID{node.NewAscLID(1)}))
+
+	result, err := aggregator.Aggregate()
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	expectedResult := seq.AggregatableSamples{
+		SamplesByBin: map[seq.AggBin]*seq.SamplesContainer{
+			// "0" because DataProvider converts TID source (tid index) to string
+			{Token: "0"}: {Total: 1},
+		},
+	}
+
+	r.Equal(len(expectedResult.SamplesByBin), len(result.SamplesByBin))
+	for token, hist := range expectedResult.SamplesByBin {
+		r.Equal(hist.Total, result.SamplesByBin[token].Total)
+	}
+}
+
+func TestAggregatorLimitExceeded(t *testing.T) {
+	// For now input for this test is incorrect since we support
+	// aggregations only for `keyword` index type.
+	// Will be fixed in #310.
+	searchDocs := []uint32{2, 3, 5, 8, 10, 12, 15}
+	sources := [][]uint32{
+		{2, 3, 5, 8, 10, 12},
+		{1, 4, 6, 9, 11, 13},
+		{1, 2, 4, 5, 8, 11, 12},
+	}
+
+	const limit = 1
+
+	for _, expectedErr := range []error{consts.ErrTooManyGroupTokens, consts.ErrTooManyFieldTokens} {
+		source := node.BuildORTreeAgg(node.MakeStaticNodes(sources))
+		iter := NewSourcedNodeIterator(source, nil, make([]uint32, len(sources)), "", iteratorLimit{limit: limit, err: expectedErr})
+		agg := NewSingleSourceCountAggregator(iter, provideExtractTimeFunc(nil, nil, 0), false)
+
+		var limitErr error
+		var limitIteration int
+
+		lids := make([]node.LID, len(searchDocs))
+		for i, id := range searchDocs {
+			lids[i] = node.NewAscLID(id)
+		}
+
+		for i := range lids {
+			if err := agg.Next(lids[i : i+1]); err != nil {
+				limitErr = err
+				limitIteration = i
+				break
+			}
+		}
+
+		assert.Equal(t, limit, limitIteration)
+		assert.ErrorIs(t, limitErr, expectedErr)
+	}
+}
+
+func TestSourceCountMap(t *testing.T) {
+	counts := newSourceCountMap(5000)
+
+	require.Len(t, counts.chunks, 5)
+
+	counts.add(uint32(100))
+
+	counts.add(uint32(100))
+	assert.Equal(t, uint64(2), counts.count(uint32(100)))
+
+	counts.add(uint32(1100))
+
+	got := make(map[uint32]uint64)
+	for source, count := range counts.all() {
+		got[source] = count
+	}
+
+	assert.Equal(t, map[uint32]uint64{100: 2, 1100: 1}, got)
+}
+
+// // TestSourceCountMapAgainstBuiltinMap validates result of using sourceCountMap against a builtin map
+func TestSourceCountMapAgainstBuiltinMap(t *testing.T) {
+	const (
+		sources = 5_000
+		updates = 15_000
+	)
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	counts := newSourceCountMap(sources)
+	want := make(map[uint32]uint64)
+
+	for range updates {
+		source := uint32(r.Intn(sources))
+		counts.add(source)
+		want[source]++
+	}
+
+	type sourceCount struct {
+		source uint32
+		count  uint64
+	}
+	wantPairs := make([]sourceCount, 0, len(want))
+	for source, count := range want {
+		wantPairs = append(wantPairs, sourceCount{source: source, count: count})
+	}
+	slices.SortFunc(wantPairs, func(a, b sourceCount) int {
+		return cmp.Compare(a.source, b.source)
+	})
+
+	gotPairs := make([]sourceCount, 0, len(want))
+	for source, count := range counts.all() {
+		gotPairs = append(gotPairs, sourceCount{source: source, count: count})
+	}
+
+	require.Len(t, gotPairs, len(want))
+	assert.Equal(t, wantPairs, gotPairs)
+	for _, pair := range gotPairs {
+		assert.Greater(t, pair.count, uint64(0))
+	}
+}
+
+// TestSourceCountMapAllOrderedBySource tests that iteration is asc ordered by source.
+func TestSourceCountMapAllOrderedBySource(t *testing.T) {
+	const (
+		sources = 10_000
+		updates = 5_000
+	)
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	counts := newSourceCountMap(sources)
+	want := make(map[uint32]struct{}, updates)
+
+	for range updates {
+		source := uint32(r.Intn(sources))
+		counts.add(source)
+		want[source] = struct{}{}
+	}
+
+	wantSources := make([]uint32, 0, len(want))
+	for source := range want {
+		wantSources = append(wantSources, source)
+	}
+	slices.Sort(wantSources)
+
+	gotSources := make([]uint32, 0, len(want))
+	for source := range counts.all() {
+		gotSources = append(gotSources, source)
+	}
+
+	require.Len(t, gotSources, len(want))
+	assert.Equal(t, wantSources, gotSources)
+}
+
+func TestTsSourceCountMap(t *testing.T) {
+	counts := newTsSourceCountMap(5000)
+
+	require.Len(t, counts.chunks, 5)
+
+	counts.add(uint32(100), 14000000)
+	counts.add(uint32(100), 14000000)
+	counts.add(uint32(1100), 20000000)
+
+	got := make(map[AggBin[int]]uint32)
+	for source, bin := range counts.all() {
+		got[AggBin[int]{Source: int(source), MID: bin.MID}] = bin.count
+	}
+
+	assert.Equal(t, map[AggBin[int]]uint32{
+		{Source: 100, MID: 14000000}:  2,
+		{Source: 1100, MID: 20000000}: 1,
+	}, got)
+}
+
+func TestTsSourceCountMap_MigrateToMap(t *testing.T) {
+	counts := newTsSourceCountMap(5000)
+
+	require.Len(t, counts.chunks, 5)
+
+	for i := 0; i < 10; i++ {
+		counts.add(uint32(100), seq.MID(10000000*i))
+	}
+
+	got := make(map[AggBin[int]]uint32)
+	for source, bin := range counts.all() {
+		got[AggBin[int]{Source: int(source), MID: bin.MID}] = bin.count
+	}
+
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, uint32(1), got[AggBin[int]{Source: 100, MID: seq.MID(10000000 * i)}])
+	}
+}
+
+func TestTsSourceCountMapAllOrderedWithMigratedBins(t *testing.T) {
+	counts := newTsSourceCountMap(4096)
+
+	for i := range 9 {
+		counts.add(100, seq.MID(i))
+	}
+	counts.add(1100, 100)
+	counts.add(2100, 200)
+	for i := range 9 {
+		counts.add(3100, seq.MID(i))
+	}
+
+	var gotBins []AggBin[int]
+	for source, bin := range counts.all() {
+		gotBins = append(gotBins, AggBin[int]{Source: int(source), MID: bin.MID})
+	}
+
+	expectedBins := make([]AggBin[int], 0, 20)
+	for i := range 9 {
+		expectedBins = append(expectedBins, AggBin[int]{Source: 100, MID: seq.MID(i)})
+	}
+	expectedBins = append(expectedBins, AggBin[int]{Source: 1100, MID: 100}, AggBin[int]{Source: 2100, MID: 200})
+	for i := range 9 {
+		expectedBins = append(expectedBins, AggBin[int]{Source: 3100, MID: seq.MID(i)})
+	}
+
+	assert.Equal(t, expectedBins, gotBins)
+}
+
+// TestTsSourceCountMapAgainstBuiltinMap validates result of using tsSourceCountMap against a builtin map
+func TestTsSourceCountMapAgainstBuiltinMap(t *testing.T) {
+	const (
+		sources = 5_000
+		mids    = 20
+		updates = 50_000
+	)
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	counts := newTsSourceCountMap(sources)
+	want := make(map[AggBin[int]]uint32)
+
+	for range updates {
+		bin := AggBin[int]{
+			Source: r.Intn(sources),
+			MID:    seq.MID(r.Intn(mids)),
+		}
+		counts.add(uint32(bin.Source), bin.MID)
+		want[bin]++
+	}
+
+	got := make(map[AggBin[int]]uint32, len(want))
+	for source, bin := range counts.all() {
+		got[AggBin[int]{Source: int(source), MID: bin.MID}] = bin.count
+	}
+
+	assert.Equal(t, want, got)
+}

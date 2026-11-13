@@ -1,0 +1,858 @@
+package search
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/alecthomas/units"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	"github.com/ozontech/seq-db/config"
+	"github.com/ozontech/seq-db/consts"
+	"github.com/ozontech/seq-db/logger"
+	"github.com/ozontech/seq-db/metric"
+	"github.com/ozontech/seq-db/parser"
+	"github.com/ozontech/seq-db/pkg/storeapi"
+	"github.com/ozontech/seq-db/proxy/stores"
+	"github.com/ozontech/seq-db/querytracer"
+	"github.com/ozontech/seq-db/seq"
+	"github.com/ozontech/seq-db/util"
+)
+
+type Config struct {
+	HotStores       *stores.Stores
+	HotReadStores   *stores.Stores
+	ReadStores      *stores.Stores
+	WriteStores     *stores.Stores
+	ShuffleReplicas bool
+	MirrorAddr      string
+}
+
+// StorageTier shows whether a search was served by hot or cold stores.
+type StorageTier string
+
+const (
+	StorageTierHot  StorageTier = "hot"
+	StorageTierCold StorageTier = "cold"
+	// StorageTierNone is used when a request never reached the ingestor
+	// (e.g. it failed validation in the proxy layer).
+	StorageTierNone StorageTier = "none"
+)
+
+// SearchStats carries observability data collected while executing a search.
+type SearchStats struct {
+	Query   string
+	From    seq.MID
+	To      seq.MID
+	Size    int
+	HasHist bool
+	HasAgg  bool
+
+	StorageTier         StorageTier
+	HotSearchDuration   time.Duration
+	ColdSearchDuration  time.Duration
+	TotalSearchDuration time.Duration
+
+	FetchStart    time.Time
+	FetchDuration time.Duration
+}
+
+func (s *SearchStats) TakeFetchDuration() {
+	if s.FetchDuration == 0 && !s.FetchStart.IsZero() {
+		s.FetchDuration = time.Since(s.FetchStart)
+	}
+}
+
+type Ingestor struct {
+	config         Config
+	clients        map[string]storeapi.StoreApiClient
+	sourceByClient map[string]uint64
+	clientBySource map[uint64]string
+}
+
+func NewIngestor(cfg Config, clients map[string]storeapi.StoreApiClient) *Ingestor {
+	sourceByClient := make(map[string]uint64, len(clients))
+	clientBySource := make(map[uint64]string, len(clients))
+	var index uint64
+	for client := range clients {
+		sourceByClient[client] = index
+		clientBySource[index] = client
+		index++
+	}
+
+	return &Ingestor{
+		config:         cfg,
+		clients:        clients,
+		sourceByClient: sourceByClient,
+		clientBySource: clientBySource,
+	}
+}
+
+func (si *Ingestor) Search(
+	ctx context.Context,
+	sr *SearchRequest,
+	tr *querytracer.Tracer,
+) (
+	qpr *seq.QPR,
+	docsStream DocsIterator,
+	stats *SearchStats,
+	err error,
+) {
+	if sr.Explain {
+		logger.Info("search request",
+			zap.String("query", string(sr.Q)),
+			zap.String("from", sr.From.String()),
+			zap.String("to", sr.To.String()),
+		)
+	}
+
+	stats = &SearchStats{
+		Query:       string(sr.Q),
+		From:        sr.From,
+		To:          sr.To,
+		Size:        sr.Size + sr.Offset,
+		HasHist:     sr.Interval > 0,
+		HasAgg:      len(sr.AggQ) > 0,
+		StorageTier: StorageTierNone,
+	}
+
+	if sr.Size < 0 || sr.Offset < 0 {
+		return nil, nil, stats, fmt.Errorf("%w: negative size or offset", consts.ErrInvalidArgument)
+	}
+
+	startTime := time.Now()
+	searchStores := si.config.HotStores
+	if si.config.HotReadStores != nil && len(si.config.HotReadStores.Shards) > 0 {
+		searchStores = si.config.HotReadStores
+	}
+	qprs, err := si.searchStores(ctx, sr, searchStores, tr)
+
+	stats.StorageTier = StorageTierHot
+	stats.HotSearchDuration = time.Since(startTime)
+
+	var partialRespErr error
+
+	if err != nil {
+		switch {
+		case errors.Is(err, consts.ErrIngestorQueryWantsOldData):
+			if len(si.config.ReadStores.Shards) == 0 {
+				logger.Error("no cold stores, but hot mode is enabled, bad configuration of stores!")
+				return nil, nil, stats, err
+			}
+			metric.SearchColdTotal.Inc()
+
+			coldStart := time.Now()
+			qprs, err = si.searchStores(ctx, sr, si.config.ReadStores, tr)
+			stats.StorageTier = StorageTierCold
+			stats.ColdSearchDuration = time.Since(coldStart)
+
+			if err != nil {
+				metric.SearchColdErrors.Add(1)
+				if errors.Is(err, consts.ErrPartialResponse) {
+					partialRespErr = err // consider partial response from cold stores as a result
+				} else {
+					// errors from both hot and cold stores, return error
+					return nil, nil, stats, err
+				}
+			}
+		case errors.Is(err, consts.ErrPartialResponse):
+			partialRespErr = err // consider partial response from hot stores as a result
+		default:
+			// unexpected error on all hot replica sets (usually bad query)
+			return nil, nil, stats, err
+		}
+	}
+
+	queryDuration := time.Since(startTime)
+
+	t := time.Now()
+	qpr = &seq.QPR{
+		Histogram: make(map[seq.MID]uint64),
+		Aggs:      make([]seq.AggregatableSamples, len(sr.AggQ)),
+	}
+	seq.MergeQPRs(qpr, qprs, sr.Offset+sr.Size, sr.Interval, sr.Order)
+	mergeDuration := time.Since(t)
+	if len(qpr.Errors) > 0 {
+		for _, errSource := range qpr.Errors {
+			host := si.clientBySource[errSource.Source]
+			logger.Info("store failed",
+				zap.String("store", host),
+				zap.String("query", string(sr.Q)),
+				zap.String("error", errSource.ErrStr),
+			)
+		}
+	}
+
+	var size int
+	qpr.IDs, size = paginateIDs(qpr.IDs, sr.Offset, sr.Size)
+	ids := qpr.IDs
+
+	stats.FetchStart = time.Now()
+	docsStream = EmptyDocsStream{}
+	if sr.ShouldFetch && size > 0 {
+		if util.IsCancelled(ctx) {
+			return nil, nil, stats, ctx.Err()
+		}
+		metric.DocumentsRequested.Observe(float64(len(ids)))
+
+		fieldsFilter := tryParseFieldsFilter(string(sr.Q))
+		docsStream, err = si.FetchDocsStream(ctx, ids, sr.Explain, true, fieldsFilter)
+		if err != nil {
+			return nil, nil, stats, err
+		}
+	}
+
+	stats.TotalSearchDuration = time.Since(startTime)
+
+	if sr.Explain {
+		logger.Info("data", zap.Any("histogram", qpr.Histogram))
+		logger.Info("search result",
+			zap.Uint64("total", qpr.Total),
+			zap.Int("fetched", len(ids)),
+			zap.Int("buckets", len(qpr.Histogram)),
+			util.ZapDurationWithPrec("query_ms", queryDuration, "ms", 2),
+			util.ZapDurationWithPrec("merge_ms", mergeDuration, "ms", 2),
+			util.ZapDurationWithPrec("all_ms", stats.TotalSearchDuration, "ms", 2),
+		)
+	}
+
+	return qpr, docsStream, stats, partialRespErr
+}
+
+// tryParseFieldsFilter tries to parse seq-ql query to extract fields/remove pipe.
+// If it fails, returns empty filter which means no filtering.
+func tryParseFieldsFilter(query string) FetchFieldsFilter {
+	// Parse seq-ql query to extract fields/remove pipe.
+	q, err := parser.ParseSeqQL(query, nil)
+	if err != nil {
+		logger.Error("failed to parse query on fetch stage", zap.String("query", query), zap.Error(err))
+		return FetchFieldsFilter{}
+	}
+	// Find first 'fields' or 'remove' pipe since only one of them is allowed.
+	for _, pipe := range q.Pipes {
+		p, ok := pipe.(*parser.PipeFields)
+		if !ok {
+			continue
+		}
+		return FetchFieldsFilter{
+			Fields:    p.Fields,
+			AllowList: !p.Except,
+		}
+	}
+	return FetchFieldsFilter{}
+}
+
+func paginateIDs(ids seq.IDSources, offset, size int) (seq.IDSources, int) {
+	if len(ids) > offset {
+		ids = ids[offset:]
+	} else {
+		ids = ids[:0]
+	}
+
+	if len(ids) > size {
+		ids = ids[:size]
+	} else {
+		size = len(ids)
+	}
+	return ids, size
+}
+
+func (si *Ingestor) singleDocsStream(
+	ctx context.Context,
+	explain, noSkipMasks bool,
+	source uint64,
+	ids []seq.IDSource,
+	fields FetchFieldsFilter,
+) (DocsIterator, error) {
+	startTime := time.Now()
+	host, has := si.clientBySource[source]
+	if !has {
+		return nil, fmt.Errorf("can't fetch: no host for source %d", source)
+	}
+	client, has := si.clients[host]
+	if !has {
+		return nil, fmt.Errorf("can't fetch: no client for host %s", host)
+	}
+
+	stream, err := client.Fetch(ctx, si.makeFetchReq(ids, explain, noSkipMasks, fields),
+		grpc.MaxCallRecvMsgSize(256*int(units.MiB)),
+		grpc.MaxCallSendMsgSize(256*int(units.MiB)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("can't fetch docs: %s", err.Error())
+	}
+
+	md, err := stream.Header()
+	protocolVersion := config.StoreProtocolVersion1
+	if err != nil {
+		return nil, fmt.Errorf("can't fetch metadata: %s", err.Error())
+	} else if md != nil {
+		if storeProtocolValues := md.Get(consts.StoreProtocolVersionHeader); len(storeProtocolValues) > 0 {
+			protocolVersion = config.ParseStoreProtocolVersion(storeProtocolValues[0])
+		}
+	}
+
+	var it DocsIterator = newGrpcStreamIterator(stream, host, source, len(ids), protocolVersion)
+	if explain {
+		it = newExplainWrapperIterator(it, ids, host, startTime)
+	}
+
+	return it, nil
+}
+
+func groupIDsBySource(ids []seq.IDSource) map[uint64][]seq.IDSource {
+	hostsIDs := make(map[uint64][]seq.IDSource)
+	for _, idSource := range ids {
+		hostsIDs[idSource.Source] = append(hostsIDs[idSource.Source], idSource)
+	}
+	return hostsIDs
+}
+
+// lessFuncPosBased returns compare function based on initial order of ids
+func lessFuncPosBased(ids []seq.IDSource) func(a, b seq.IDSource) bool {
+	positions := make(map[seq.IDSource]uint32, len(ids))
+	for i, id := range ids {
+		positions[seq.IDSource{ID: id.ID, Source: id.Source}] = uint32(i)
+	}
+	return func(a, b seq.IDSource) bool {
+		aPos, aOk := positions[a]
+		bPos, bOk := positions[b]
+		if !aOk || !bOk {
+			if !aOk && !bOk {
+				panic("attempt to compare unknown IDSources")
+			}
+			// a is unknown, we treat it as true
+			// b is unknown: we treat it as false
+			// we treat the unknown as the smallest to pass it first and move on to the next document in the stream
+			return !aOk
+		}
+		return aPos < bPos
+	}
+}
+
+type FetchFieldsFilter struct {
+	// Fields list of fields to fetch. Empty list means to fetch all fields.
+	Fields []string
+	// AllowList truth if we need to exclude all fields except the fields from the Fields list
+	// and false if we need to exclude given Fields from a fetch result.
+	AllowList bool
+}
+
+func (si *Ingestor) FetchDocsStream(
+	ctx context.Context,
+	ids []seq.IDSource,
+	explain, noSkipMasks bool,
+	ff FetchFieldsFilter,
+) (DocsIterator, error) {
+	errs := make([]error, 0)
+	streams := make([]DocsIterator, 0)
+	for source, ids := range groupIDsBySource(ids) {
+		if stream, err := si.singleDocsStream(ctx, explain, noSkipMasks, source, ids, ff); err != nil {
+			metric.FetchErrors.Inc()
+			errs = append(errs, err)
+			logger.Error("fetch error", zap.Error(err), zap.String("store", si.clientBySource[source]))
+		} else {
+			streams = append(streams, stream)
+		}
+	}
+
+	if len(errs) > 0 && len(streams) == 0 {
+		return nil, fmt.Errorf("all shards requests failed: %w", util.CollapseErrors(errs))
+	}
+
+	// if we have at least one stream, we continue processing
+	return newMergedStreamIterator(ctx, streams, ids), nil
+}
+
+func expandIDsBySources(orig []seq.ID, clientBySource map[uint64]string) []seq.IDSource {
+	ids := make([]seq.IDSource, 0, len(orig)*len(clientBySource))
+	for _, id := range orig {
+		for source := range clientBySource {
+			ids = append(ids, seq.IDSource{ID: id, Source: source})
+		}
+	}
+	return ids
+}
+
+type FetchRequest struct {
+	IDs          []seq.ID
+	FieldsFilter FetchFieldsFilter
+}
+
+func (si *Ingestor) Documents(ctx context.Context, r FetchRequest) (DocsIterator, error) {
+	metric.DocumentsRequested.Observe(float64(len(r.IDs)))
+	// todo: ***REMOVED*** we fetch from both stores hot and cold there; need fix that
+	docsStream, err := si.FetchDocsStream(ctx, expandIDsBySources(r.IDs, si.clientBySource), false, false, r.FieldsFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	return newUniqueIDIterator(docsStream), nil
+}
+
+func (si *Ingestor) Document(ctx context.Context, id seq.ID, ff FetchFieldsFilter) []byte {
+	docsStream, err := si.Documents(ctx, FetchRequest{IDs: []seq.ID{id}, FieldsFilter: ff})
+	if err != nil {
+		return nil
+	}
+	docs := ReadAll(docsStream)
+	if len(docs) == 0 {
+		logger.Warn("doc not found", zap.String("id", id.String()))
+		return nil
+	}
+	if len(docs) > 1 {
+		logger.Error("to many docs in result", zap.String("id", id.String()), zap.Any("docs", docs))
+		return nil
+	}
+	return docs[0]
+}
+
+func (si *Ingestor) makeFetchReq(ids []seq.IDSource, explain, noSkipMasks bool, ff FetchFieldsFilter) *storeapi.FetchRequest {
+	idsWithHints := make([]*storeapi.IdWithHint, 0, len(ids))
+	idsStr := make([]string, 0, len(ids))
+	if len(ids) > 0 {
+		lastID := ids[0]
+		for _, id := range ids {
+			if id.ID.MID > lastID.ID.MID {
+				logger.Error("wrong fetch req, ids should be sorted",
+					zap.String("prev", lastID.ID.String()),
+					zap.String("cur", id.ID.String()),
+				)
+			}
+			lastID = id
+			idsStr = append(idsStr, id.ID.String())
+			idsWithHints = append(idsWithHints, &storeapi.IdWithHint{
+				Id:   id.ID.String(),
+				Hint: id.Hint,
+			})
+		}
+	}
+
+	return &storeapi.FetchRequest{
+		Ids:          idsStr,
+		Explain:      explain,
+		IdsWithHints: idsWithHints,
+		FieldsFilter: &storeapi.FetchRequest_FieldsFilter{
+			Fields:    ff.Fields,
+			AllowList: ff.AllowList,
+		},
+		NoSkipMasks: noSkipMasks,
+	}
+}
+
+// todo: consider from param
+func (si *Ingestor) aggregate(times []time.Time, docs []int, to, interval seq.MID, ids []seq.ID) ([]time.Time, []int, seq.MID) {
+	curTime := to
+	curTime /= interval
+	curTime *= interval // let's start with discrete point
+	if len(docs) == 0 {
+		docs = append(docs, 0)
+		times = append(times, time.Unix(0, 0).Add(seq.MIDToDuration(curTime)))
+	}
+	for _, id := range ids {
+		t := id.MID
+		if t > curTime+interval {
+			continue
+		}
+
+		for t < curTime {
+			curTime -= interval
+			times = append(times, time.Unix(0, 0).Add(seq.MIDToDuration(curTime)))
+			docs = append(docs, 0)
+		}
+		docs[len(docs)-1]++
+	}
+
+	return times, docs, curTime
+}
+
+func (si *Ingestor) searchStores(
+	ctx context.Context,
+	sr *SearchRequest,
+	s *stores.Stores,
+	tr *querytracer.Tracer,
+) ([]*seq.QPR, error) {
+	request := sr.GetAPISearchRequest()
+
+	// this cancellation can be useful in the case where we received an ErrIngestorQueryWantsOldData error
+	// from one store and we do not need to continue executing queries in the remaining stores
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type ShardResponse struct {
+		Data   *storeapi.SearchResponse
+		Source uint64
+		Err    error
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(s.Shards))
+	respChan := make(chan ShardResponse, len(s.Shards))
+	for _, shard := range s.Shards {
+		searchShardTr := tr.NewChild("proxy/searchShard")
+		go func(shard []string, tr *querytracer.Tracer) {
+			defer wg.Done()
+			defer tr.Done()
+
+			resp, source, err := si.searchShard(ctx, shard, request, tr)
+			respChan <- ShardResponse{
+				Data:   resp,
+				Source: source,
+				Err:    err,
+			}
+		}(shard, searchShardTr)
+	}
+
+	go func() {
+		wg.Wait()
+		close(respChan)
+	}()
+
+	qprs := make([]*seq.QPR, 0, len(s.Shards))
+	var errs []error
+	for resp := range respChan {
+		if err := resp.Err; err != nil {
+			if errors.Is(err, consts.ErrIngestorQueryWantsOldData) {
+				// At least one hot store doesn't have such old data
+				return nil, err
+			}
+			if errors.Is(err, consts.ErrTooManyFractionsHit) {
+				return nil, err
+			}
+			errs = append(errs, err)
+			continue
+		}
+
+		qprs = append(qprs, responseToQPR(resp.Data, resp.Source, sr.Explain))
+	}
+
+	if err := util.DeduplicateErrors(errs); err != nil {
+		if len(qprs) != 0 {
+			// There are errors, but some Shards returned data, so provide it to user
+			return qprs, fmt.Errorf("%w: %s", consts.ErrPartialResponse, err)
+		}
+		return nil, err
+	}
+
+	return qprs, nil
+}
+
+func responseToQPR(resp *storeapi.SearchResponse, source uint64, explain bool) *seq.QPR {
+	if explain {
+		logger.Info("received from seq-db",
+			zap.Int("len_ids", len(resp.IdSources)),
+			zap.Uint64("found", resp.Total),
+		)
+	}
+
+	ids := make(seq.IDSources, 0, len(resp.IdSources))
+	for _, idSource := range resp.IdSources {
+		ids = append(ids, seq.IDSource{
+			ID: seq.ID{
+				MID: seq.MID(idSource.Id.Mid),
+				RID: seq.RID(idSource.Id.Rid),
+			},
+			Source: source,
+			Hint:   idSource.Hint,
+		})
+	}
+
+	hist := make(map[seq.MID]uint64, len(resp.Histogram))
+	for k, v := range resp.Histogram {
+		hist[seq.MID(k)] = v
+	}
+
+	aggs := make([]seq.AggregatableSamples, len(resp.Aggs))
+	for i, agg := range resp.Aggs {
+		from := agg.Timeseries
+		to := make(map[seq.AggBin]*seq.SamplesContainer)
+
+		for _, bin := range from {
+			pbhist := bin.Hist
+
+			tbin := seq.AggBin{
+				MID:   seq.MID(bin.Ts.AsTime().UnixNano()),
+				Token: bin.Label,
+			}
+
+			var values map[uint32]struct{}
+			if len(pbhist.Values) > 0 {
+				values = make(map[uint32]struct{}, len(pbhist.Values))
+				for _, idx := range pbhist.Values {
+					values[idx] = struct{}{}
+				}
+			}
+
+			to[tbin] = &seq.SamplesContainer{
+				Min:       pbhist.Min,
+				Max:       pbhist.Max,
+				Sum:       pbhist.Sum,
+				Total:     pbhist.Total,
+				Samples:   pbhist.Samples,
+				NotExists: pbhist.NotExists,
+				Values:    values,
+			}
+		}
+
+		aggs[i] = seq.AggregatableSamples{
+			SamplesByBin: to,
+			NotExists:    agg.NotExists,
+			ValuesPool:   agg.ValuesPool,
+		}
+	}
+
+	errSources := make([]seq.ErrorSource, 0, len(resp.Errors))
+	for _, err := range resp.Errors {
+		errSources = append(errSources, seq.ErrorSource{
+			ErrStr: err,
+			Source: source,
+		})
+	}
+
+	return &seq.QPR{
+		IDs:       ids,
+		Histogram: hist,
+		Aggs:      aggs,
+		Total:     resp.Total,
+		Errors:    errSources,
+	}
+}
+
+// searchShard searches on all hosts of given shard. Returns err only if all hosts return err.
+func (si *Ingestor) searchShard(
+	ctx context.Context,
+	hosts []string,
+	request *storeapi.SearchRequest,
+	tr *querytracer.Tracer,
+) (*storeapi.SearchResponse, uint64, error) {
+	var idx []int
+	if si.config.ShuffleReplicas {
+		idx = util.IdxShuffle(len(hosts))
+	} else {
+		idx = util.IdxFill(len(hosts))
+	}
+
+	var errs []error
+	for i := 0; i < len(hosts); i++ {
+		host := hosts[idx[i]]
+		tr.Printf("Making search request to %s", host)
+		resp, source, err := si.searchHost(ctx, request, host)
+
+		// TODO: remove in future versions
+		if err != nil {
+			errMessage := status.Convert(err).Message()
+			tr.Printf("Got error from %s: %s", host, errMessage)
+			if errMessage == consts.ErrIngestorQueryWantsOldData.Error() {
+				// only hot store can return such error
+				// fail fast in this case
+				return nil, source, fmt.Errorf("hot store refuses: %w", consts.ErrIngestorQueryWantsOldData)
+			}
+			if errMessage == consts.ErrTooManyFieldTokens.Error() {
+				return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyFieldTokens)
+			}
+			if errMessage == consts.ErrTooManyFieldValues.Error() {
+				return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyFieldValues)
+			}
+			if errMessage == consts.ErrTooManyGroupTokens.Error() {
+				return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyGroupTokens)
+			}
+			if errMessage == consts.ErrTooManyFractionTokens.Error() {
+				return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyFractionTokens)
+			}
+			if errMessage == consts.ErrMemoryLimitExceeded.Error() {
+				return nil, source, fmt.Errorf("store forbids search request: %w", consts.ErrMemoryLimitExceeded)
+			}
+			errs = append(errs, err)
+			continue
+		}
+
+		if resp.Explain != nil {
+			tr.AddChildWithSpan(explainEntryToTracerSpan(resp.Explain))
+		}
+
+		switch resp.Code {
+		case storeapi.SearchErrorCode_INGESTOR_QUERY_WANTS_OLD_DATA:
+			return nil, source, fmt.Errorf("hot store refuses: %w", consts.ErrIngestorQueryWantsOldData)
+		case storeapi.SearchErrorCode_TOO_MANY_FIELD_TOKENS:
+			return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyFieldTokens)
+		case storeapi.SearchErrorCode_TOO_MANY_FIELD_VALUES:
+			return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyFieldValues)
+		case storeapi.SearchErrorCode_TOO_MANY_GROUP_TOKENS:
+			return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyGroupTokens)
+		case storeapi.SearchErrorCode_TOO_MANY_FRACTION_TOKENS:
+			return nil, source, fmt.Errorf("store forbids aggregation request: %w", consts.ErrTooManyFractionTokens)
+		case storeapi.SearchErrorCode_MEMORY_LIMIT_EXCEEDED:
+			return nil, source, fmt.Errorf("store forbids search request: %w", consts.ErrMemoryLimitExceeded)
+		case storeapi.SearchErrorCode_TOO_MANY_FRACTIONS_HIT:
+			return nil, source, fmt.Errorf("store forbids request: %w", consts.ErrTooManyFractionsHit)
+		}
+
+		return resp, source, nil
+	}
+
+	return nil, 0, util.DeduplicateErrors(errs)
+}
+
+// searchHost search req on single host.
+func (si *Ingestor) searchHost(ctx context.Context, req *storeapi.SearchRequest, host string) (*storeapi.SearchResponse, uint64, error) {
+	client, has := si.clients[host]
+	if !has {
+		logger.Panic("internal connection map corruption, no client for host",
+			zap.String("host", host),
+		)
+	}
+
+	var md metadata.MD
+	data, err := client.Search(ctx, req,
+		grpc.MaxCallRecvMsgSize(config.MaxGrpcMessageSizeBytes),
+		grpc.MaxCallSendMsgSize(config.MaxGrpcMessageSizeBytes),
+		grpc.UseCompressor(gzip.Name),
+		grpc.Header(&md),
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// If header indicates protocol version 1 (MID in milliseconds), then convert to nanoseconds
+	protocolVersion := config.StoreProtocolVersion1
+	if storeProtocolValues := md.Get(consts.StoreProtocolVersionHeader); len(storeProtocolValues) > 0 {
+		protocolVersion = config.ParseStoreProtocolVersion(storeProtocolValues[0])
+	}
+
+	// Convert legacy store response (protocol version 1) to nanoseconds MID
+	if protocolVersion == config.StoreProtocolVersion1 {
+		for _, id := range data.IdSources {
+			id.Id.Mid = uint64(seq.MillisToMID(id.Id.Mid))
+		}
+
+		if len(data.Histogram) > 0 {
+			newHist := make(map[uint64]uint64, len(data.Histogram))
+			for mid, v := range data.Histogram {
+				newHist[uint64(seq.MillisToMID(mid))] = v
+			}
+			data.Histogram = newHist
+		}
+	}
+
+	return data, si.sourceByClient[host], nil
+}
+
+func explainEntryToTracerSpan(e *storeapi.ExplainEntry) *querytracer.Span {
+	if e == nil {
+		return nil
+	}
+
+	span := &querytracer.Span{
+		Message:  e.Message,
+		Duration: e.Duration.AsDuration(),
+	}
+
+	for _, child := range e.Children {
+		span.Children = append(span.Children, explainEntryToTracerSpan(child))
+	}
+
+	return span
+}
+
+type IngestorStatus struct {
+	NumberOfStores    int
+	OldestStorageTime *time.Time
+	Stores            []StoreStatus
+}
+
+type StoreStatus struct {
+	Host       string
+	OldestTime time.Time
+	Error      string
+}
+
+func (si *Ingestor) Status(ctx context.Context) *IngestorStatus {
+	storesHosts := si.getStoresHosts()
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(storesHosts))
+	respChan := make(chan StoreStatus, len(storesHosts))
+
+	for _, host := range storesHosts {
+		go func(host string) {
+			defer wg.Done()
+
+			client, has := si.clients[host]
+			if !has {
+				respChan <- StoreStatus{Host: host, Error: fmt.Sprintf("no client for host: %s", host)}
+				return
+			}
+			resp, err := client.Status(ctx, &storeapi.StatusRequest{})
+			if err != nil {
+				respChan <- StoreStatus{Host: host, Error: err.Error()}
+				return
+			}
+			respChan <- StoreStatus{Host: host, OldestTime: resp.OldestTime.AsTime()}
+		}(host)
+	}
+
+	go func() {
+		wg.Wait()
+		close(respChan)
+	}()
+
+	var oldestTime *time.Time
+
+	storesStatuses := make([]StoreStatus, 0, len(storesHosts))
+	for resp := range respChan {
+		if resp.Error != "" {
+			storesStatuses = append(storesStatuses, StoreStatus{
+				Host:  resp.Host,
+				Error: resp.Error,
+			})
+			continue
+		}
+		ot := resp.OldestTime
+		storesStatuses = append(storesStatuses, StoreStatus{
+			Host:       resp.Host,
+			OldestTime: ot,
+		})
+		if oldestTime == nil || ot.Before(*oldestTime) {
+			oldestTime = &ot
+		}
+	}
+
+	return &IngestorStatus{
+		NumberOfStores:    len(storesHosts),
+		OldestStorageTime: oldestTime,
+		Stores:            storesStatuses,
+	}
+}
+
+func (si *Ingestor) getStoresHosts() []string {
+	numberOfStores := len(si.config.HotStores.Shards) + len(si.config.HotReadStores.Shards) +
+		len(si.config.ReadStores.Shards) + len(si.config.WriteStores.Shards)
+
+	hosts := make([]string, 0, numberOfStores)
+	seen := make(map[string]struct{}, numberOfStores)
+
+	shards := make([][]string, 0, numberOfStores)
+	shards = append(shards, si.config.HotStores.Shards...)
+	shards = append(shards, si.config.HotReadStores.Shards...)
+	shards = append(shards, si.config.ReadStores.Shards...)
+	shards = append(shards, si.config.WriteStores.Shards...)
+
+	for _, shard := range shards {
+		for _, host := range shard {
+			if _, ok := seen[host]; ok {
+				continue
+			}
+			hosts = append(hosts, host)
+			seen[host] = struct{}{}
+		}
+	}
+
+	return hosts
+}

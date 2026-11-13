@@ -1,0 +1,489 @@
+package processor
+
+import (
+	"context"
+	"errors"
+	"math"
+	"math/rand/v2"
+	"sync"
+	"time"
+
+	"github.com/ozontech/seq-db/config"
+	"github.com/ozontech/seq-db/consts"
+	"github.com/ozontech/seq-db/frac/sealed/lids"
+	"github.com/ozontech/seq-db/metric/stopwatch"
+	"github.com/ozontech/seq-db/node"
+	"github.com/ozontech/seq-db/parser"
+	"github.com/ozontech/seq-db/seq"
+	"github.com/ozontech/seq-db/util"
+)
+
+// IDsIndex provide access to seq.ID by seq.LID
+// where seq.LID (Local ID) is a position of seq.ID in sorted sequence.
+// seq.ID sorted in descending order, so for seq.LID1 > seq.LID2
+// we have seq.ID1 < seq.ID2
+type idsIndex interface {
+	// LessOrEqual checks if seq.ID in LID position less or equal searched seq.ID, i.e. seqID(lid) <= id
+	LessOrEqual(lid seq.LID, id seq.ID) bool
+	GetMID(seq.LID) seq.MID
+	GetMIDs(lids []node.LID, out []seq.MID) []seq.MID
+	GetRID(seq.LID) seq.RID
+	GetRIDs(lids []node.LID, out []seq.RID) []seq.RID
+	Len() int
+}
+
+type tokenIndex interface {
+	GetValByTID(tid uint32, field string) []byte
+	GetTIDsByField(field string) ([]uint32, error)
+	GetTIDsByTokenExpr(token parser.Token) ([]uint32, error)
+	GetFreqsByTIDs(tids []uint32, field string) []uint32
+	GetLIDsFromTIDs(tids []uint32, stats lids.Counter, minLID, maxLID uint32, order seq.DocsOrder) []node.Node
+	GetBatchedLIDsFromTIDs(tids []uint32, stats lids.Counter, minLID, maxLID uint32, order seq.DocsOrder) []node.BatchedNode
+}
+
+type sealedTokenIndex interface {
+	tokenIndex
+	FieldIterator(tids []uint32, stats lids.Counter) FieldLIDs
+}
+
+// FieldLIDs iterates LID lists of one field in TID (source) order.
+// NextBatch returns:
+//   - lids: concatenated LID values
+//   - offsets: list boundaries in lids (same layout as lids.Block)
+//   - isFirstLID: true when the first list in the batch begins in this block
+//     (false when it continues a list split across the previous block)
+//
+// Exhausted when len(lids) == 0.
+type FieldLIDs interface {
+	NextBatch(lids, offsets []uint32) (outLids, outOffsets []uint32, isFirstLID bool)
+}
+
+type searchIndex interface {
+	tokenIndex
+	idsIndex
+	GetSkipLIDs(minLID, maxLID uint32, reverse bool) (node.Node, bool, func() error, error)
+}
+
+type searchBuffers struct {
+	mids []seq.MID
+	rids []seq.RID
+	lids []node.LID
+	tmp  []uint32
+}
+
+var searchBuffersPool = sync.Pool{
+	New: func() any {
+		return &searchBuffers{
+			// Currently, we drain up to 4k lids from eval tree, but with proper batching enabled
+			// we can get as much as whole LID block can have (currently, 64k lids)
+			lids: make([]node.LID, 0, consts.DefaultLIDBlockCap),
+			tmp:  make([]uint32, 0, consts.DefaultLIDBlockCap),
+			mids: make([]seq.MID, 0, consts.DefaultLIDBlockCap),
+			rids: make([]seq.RID, 0, consts.DefaultLIDBlockCap),
+		}
+	},
+}
+
+func IndexSearch(
+	ctx context.Context,
+	fracVer config.BinaryDataVersion,
+	params SearchParams,
+	index searchIndex,
+	aggLimits AggLimits,
+	queryOpt QueryOptimizationConfig,
+	sw *stopwatch.Stopwatch,
+) (qpr *seq.QPR, err error) {
+	stats := &searchStats{}
+	cache := make(tidsCache)
+
+	m := sw.Start("ast_resolve")
+	ast, empty, err := astResolve(params.AST, index, cache, sw)
+	m.Stop()
+	if err != nil {
+		return nil, err
+	}
+
+	if empty {
+		stats.UpdateMetrics()
+		return emptyQPR(params), nil
+	}
+
+	params.AST = ast
+	m = sw.Start("get_lids_borders")
+	minLID, maxLID := getLIDsBorders(params, index)
+	m.Stop()
+
+	m = sw.Start("get_skip_lids")
+	skipLIDs, hasSkipLIDs, release, err := index.GetSkipLIDs(minLID, maxLID, params.Order.IsReverse())
+	defer func() {
+		err = errors.Join(err, release())
+	}()
+	m.Stop()
+	if err != nil {
+		return nil, err
+	}
+
+	m = sw.Start("build_batch_eval_tree")
+	// TODO(cheb0) skipmasks block batched execution
+	var evalTree node.BatchedNode
+	if !hasSkipLIDs {
+		evalTree, err = tryBuildBatchEvalTree(
+			params.AST, fracVer, index, cache, queryOpt, minLID, maxLID, stats, params.Order, sw,
+		)
+	} else {
+		err = errBatchingUnsupported
+	}
+	m.Stop()
+	if err != nil && !errors.Is(err, errBatchingUnsupported) {
+		return nil, err
+	}
+
+	if errors.Is(err, errBatchingUnsupported) {
+		m = sw.Start("eval_leaf")
+		var nodeTree node.Node
+		nodeTree, err = buildEvalTree(params.AST, minLID, maxLID, stats, params.Order.IsReverse(),
+			func(token parser.Token) (node.Node, error) {
+				return evalLeaf(index, token, cache, sw, stats, minLID, maxLID, params.Order)
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.Stop()
+
+		if hasSkipLIDs {
+			m = sw.Start("eval_skip_lids")
+			nodeTree = evalSkipLIDs(nodeTree, skipLIDs, stats)
+			m.Stop()
+		}
+
+		evalTree = node.NewBatcherNode(nodeTree, params.Order.IsDesc())
+	} else {
+		batchExecutionFracsTotal.Inc()
+	}
+
+	defer func(start time.Time) { stats.TreeDuration += time.Since(start) }(time.Now())
+
+	if util.IsCancelled(ctx) {
+		return nil, ctx.Err()
+	}
+
+	var aggSupplier func(QueryStats) ([]Aggregator, error)
+
+	if params.HasAgg() {
+		aggSupplier = func(queryStats QueryStats) ([]Aggregator, error) {
+			mAgg := sw.Start("eval_agg")
+			defer mAgg.Stop()
+
+			aggs := make([]Aggregator, len(params.AggQ))
+			for i, query := range params.AggQ {
+				aggs[i], err = evalAgg(
+					index, query, sw, stats, minLID, maxLID, aggLimits,
+					provideExtractTimeFunc(sw, index, query.Interval), params.Order,
+					queryStats, queryOpt,
+				)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			return aggs, nil
+		}
+	}
+
+	m = sw.Start("iterate_eval_tree")
+	total, ids, histMap, aggs, err := iterateEvalTree(ctx, params, index, evalTree, aggSupplier, minLID, maxLID, sw)
+	m.Stop()
+
+	if len(aggs) > 0 {
+		defer func() {
+			for _, agg := range aggs {
+				agg.Release()
+			}
+		}()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	stats.HitsTotal += total
+
+	var aggsResult []seq.AggregatableSamples
+	if len(aggs) > 0 {
+		aggsResult = make([]seq.AggregatableSamples, len(aggs))
+		m = sw.Start("agg_node_make_map")
+		for i := range aggs {
+			aggsResult[i], err = aggs[i].Aggregate()
+			if err != nil {
+				m.Stop()
+				return nil, err
+			}
+			if len(aggsResult[i].SamplesByBin) > aggLimits.MaxGroupTokens && aggLimits.MaxGroupTokens > 0 {
+				return nil, consts.ErrTooManyGroupTokens
+			}
+		}
+		m.Stop()
+	}
+
+	if !params.WithTotal {
+		total = 0
+	}
+
+	qpr = &seq.QPR{
+		IDs:       ids,
+		Aggs:      aggsResult,
+		Total:     uint64(total),
+		Histogram: histMap.ToMap(),
+	}
+
+	stats.UpdateMetrics()
+
+	return qpr, nil
+}
+
+// emptyQPR is the result IndexSearch produces when the eval tree yields no LIDs.
+func emptyQPR(params SearchParams) *seq.QPR {
+	qpr := &seq.QPR{}
+	if params.HasHist() {
+		qpr.Histogram = map[seq.MID]uint64{}
+	}
+	return qpr
+}
+
+func iterateEvalTree(
+	ctx context.Context,
+	params SearchParams,
+	idsIndex idsIndex,
+	evalTree node.BatchedNode,
+	aggSupplier func(QueryStats) ([]Aggregator, error),
+	minLID, maxLID uint32,
+	sw *stopwatch.Stopwatch,
+) (int, seq.IDSources, HistMap, []Aggregator, error) {
+	hasHist := params.HasHist()
+	needScanAllRange := params.IsScanAllRequest()
+
+	var (
+		total  int
+		hist   HistMap
+		lastID seq.ID
+		ids    seq.IDSources
+	)
+
+	if hasHist {
+		hist = NewHistMap(params.From, params.To, params.HistInterval)
+	}
+
+	buffers := searchBuffersPool.Get().(*searchBuffers)
+	defer searchBuffersPool.Put(buffers)
+
+	mids := buffers.mids
+	rids := buffers.rids
+	lidsBuf := buffers.lids[:cap(buffers.lids)]
+	tmpBuf := buffers.tmp[:cap(buffers.tmp)]
+
+	timerEval := sw.Timer("eval_tree_next")
+	timerMID := sw.Timer("get_mid")
+	timerHist := sw.Timer("update_hist")
+	timerRID := sw.Timer("get_rid")
+	timerAgg := sw.Timer("agg_node_count")
+
+	sample := sampler(params.Downsample)
+
+	var aggs []Aggregator
+	for (params.Limit-len(ids)) > 0 || needScanAllRange {
+		if util.IsCancelled(ctx) {
+			return total, ids, hist, aggs, ctx.Err()
+		}
+
+		timerEval.Start()
+		batch := evalTree.NextBatch()
+		timerEval.Stop()
+
+		if batch.IsEmpty() {
+			break
+		}
+
+		iter := batch.ManyIter(params.Order.IsDesc())
+
+		// Process batch part by part (batches can be quite large currently)
+		for (params.Limit-len(ids)) > 0 || needScanAllRange {
+			if util.IsCancelled(ctx) {
+				return total, ids, hist, aggs, ctx.Err()
+			}
+
+			needIDs := params.Limit - len(ids)
+
+			// Estimate how many LIDs we want in the next part to keep the balance between unneeded work and batch part size.
+			var toProcessLIDs int
+			if needIDs > 0 {
+				// We have IDs to fill for search - iterate batch by supposedly smaller parts with length equal to count of IDs needed
+				// This allows fetching MIDs for the entire batch part to serve for IDs creation and hist
+				toProcessLIDs = min(needIDs, cap(lidsBuf))
+			} else if needScanAllRange || params.Downsample > 1 {
+				// We don't have IDs to fill for search. We now operate on larger parts (size is capped by tmp buff).
+				// If it's a hist request, then we fetch MIDs for entire part which means no unneeded work is done.
+				toProcessLIDs = cap(lidsBuf)
+			}
+
+			timerEval.Start()
+			n := iter.CopyLIDs(lidsBuf[:toProcessLIDs], tmpBuf[:toProcessLIDs])
+			timerEval.Stop()
+
+			// no more LIDs left in the current batch
+			if n == 0 {
+				break
+			}
+
+			// get the copied LIDs part of batch
+			lidsBatch := lidsBuf[:n]
+
+			// TODO(cheb0) not correct for nested indexes
+			total += n
+
+			lidsBatch = sample(lidsBatch)
+
+			if len(lidsBatch) == 0 {
+				continue
+			}
+
+			if hasHist || needIDs > 0 {
+				timerMID.Start()
+				mids = idsIndex.GetMIDs(lidsBatch, mids[:0])
+				timerMID.Stop()
+
+				if hasHist {
+					timerHist.Start()
+					hist.Update(mids)
+					timerHist.Stop()
+				}
+
+				if needIDs > 0 {
+					timerRID.Start()
+					rids = idsIndex.GetRIDs(lidsBatch, rids[:0])
+					timerRID.Stop()
+
+					// fill IDs for search
+					for i := 0; i < len(lidsBatch) && params.Limit-len(ids) > 0; i++ {
+						id := seq.ID{MID: mids[i], RID: rids[i]}
+						if len(ids) == 0 || lastID != id { // lids increase monotonically, it's enough to compare current id with the last one
+							ids = append(ids, seq.IDSource{ID: id})
+						}
+						lastID = id
+					}
+				}
+			}
+
+			// Update aggregators
+			if params.HasAgg() {
+				var err error
+				if aggs, err = updateAggs(aggs, lidsBatch, aggSupplier, minLID, maxLID, timerAgg); err != nil {
+					return total, ids, hist, aggs, err
+				}
+			}
+		}
+	}
+
+	return total, ids, hist, aggs, nil
+}
+
+func updateAggs(
+	aggs []Aggregator,
+	lidsSlice []node.LID,
+	aggSupplier func(QueryStats) ([]Aggregator, error),
+	minLID, maxLID uint32,
+	timer *stopwatch.Timer,
+) ([]Aggregator, error) {
+	if aggs == nil {
+		var err error
+		queryStats := NewQueryStats(lidsSlice, minLID, maxLID)
+		if aggs, err = aggSupplier(queryStats); err != nil { // sw timer is activated inside aggSupplier
+			return nil, err
+		}
+	}
+
+	timer.Start()
+	defer timer.Stop()
+
+	for i := range aggs {
+		if err := aggs[i].Next(lidsSlice); err != nil {
+			return aggs, err
+		}
+	}
+	return aggs, nil
+}
+
+func sampler(n uint32) func(in []node.LID) []node.LID {
+	if n <= 1 { // 0 or 1 -> no sample
+		return func(in []node.LID) []node.LID {
+			return in
+		}
+	}
+
+	cnt := rand.Uint32N(n)
+	return func(in []node.LID) []node.LID {
+		i := 0
+		for _, lid := range in {
+			if cnt%n == 0 {
+				in[i] = lid
+				i++
+			}
+			cnt++
+		}
+		return in[:i]
+	}
+}
+
+// getLIDsBorders return min and max LID borders (including) for search
+func getLIDsBorders(params SearchParams, idsIndex idsIndex) (uint32, uint32) {
+	if idsIndex.Len() == 0 {
+		return 0, 0
+	}
+	minMID := params.From
+	maxMID := params.To
+
+	minID := seq.ID{MID: minMID, RID: 0}
+	maxID := seq.ID{MID: maxMID, RID: math.MaxUint64}
+
+	minIDFromOffset := false
+	if uint64(params.OffsetId.MID) != 0 {
+		if params.Order == seq.DocsOrderDesc && seq.Less(params.OffsetId, maxID) {
+			// decrement RID by 1 to exclude already seen document while paging
+			maxID = params.OffsetId.Dec()
+		}
+		if params.Order == seq.DocsOrderAsc && seq.Less(minID, params.OffsetId) {
+			minID = params.OffsetId.Inc()
+			minIDFromOffset = true
+		}
+	}
+
+	from := 1 // first ID is not accessible (lid == 0 is invalid value)
+	to := idsIndex.Len() - 1
+
+	// decrementing minMID to make LessOrEqual work like Less
+	// do not decrement minID if min ID comes from offset-id since we have to exclude the doc ID equal to offset-id
+	if !minIDFromOffset && minMID > 0 {
+		minID.MID--
+		minID.RID = math.MaxUint64
+	}
+
+	// minLID corresponds to maxMID and maxLID corresponds to minMID due to reverse order of MIDs
+	minLID := util.BinSearchInRange(from, to, func(lid int) bool { return idsIndex.LessOrEqual(seq.LID(lid), maxID) })
+	maxLID := util.BinSearchInRange(minLID, to, func(lid int) bool { return idsIndex.LessOrEqual(seq.LID(lid), minID) }) - 1
+
+	return uint32(minLID), uint32(maxLID)
+}
+
+func MergeQPRs(qprs []*seq.QPR, params SearchParams) *seq.QPR {
+	if len(qprs) == 0 {
+		return &seq.QPR{
+			Histogram: make(map[seq.MID]uint64),
+			Aggs:      make([]seq.AggregatableSamples, len(params.AggQ)),
+		}
+	}
+	qpr := qprs[0]
+	if len(qprs) > 1 {
+		seq.MergeQPRs(qpr, qprs[1:], params.Limit, seq.MillisToMID(params.HistInterval), params.Order)
+	}
+	return qpr
+}

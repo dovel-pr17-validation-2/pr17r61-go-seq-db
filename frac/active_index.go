@@ -1,0 +1,344 @@
+package frac
+
+import (
+	"context"
+	"math"
+	"slices"
+
+	"github.com/ozontech/seq-db/frac/common"
+	"github.com/ozontech/seq-db/frac/processor"
+	"github.com/ozontech/seq-db/frac/sealed/lids"
+	"github.com/ozontech/seq-db/metric/stopwatch"
+	"github.com/ozontech/seq-db/node"
+	"github.com/ozontech/seq-db/parser"
+	"github.com/ozontech/seq-db/seq"
+	"github.com/ozontech/seq-db/storage"
+)
+
+type activeDataProvider struct {
+	ctx    context.Context
+	config *Config
+	info   *common.Info
+
+	mids *UInt64s
+	rids *UInt64s
+
+	tokenList *TokenList
+
+	docsPositions *DocsPositions
+	idsToLids     *ActiveLIDs
+	docsReader    storage.DocsReader
+
+	idsIndex *activeIDsIndex
+
+	skipMaskProvider skipMaskProvider
+}
+
+func (dp *activeDataProvider) release() {
+	if dp.idsIndex != nil {
+		dp.idsIndex.inverser.Release()
+	}
+}
+
+// getIDsIndex creates on demand and returns ActiveIDsIndex.
+// Creation of inverser for ActiveIDsIndex is expensive operation
+func (dp *activeDataProvider) getIDsIndex() *activeIDsIndex {
+	if dp.idsIndex == nil {
+		// creation order is matter
+		mapping := dp.tokenList.GetAllTokenLIDs().GetLIDs(dp.mids, dp.rids)
+		mids := dp.mids.GetVals() // mids and rids should be created after mapping to ensure that
+		rids := dp.rids.GetVals() // they contain all the ids that mapping contains.
+		dp.idsIndex = &activeIDsIndex{
+			inverser: newInverser(mapping, len(mids)),
+			mids:     mids,
+			rids:     rids,
+		}
+	}
+	return dp.idsIndex
+}
+
+func (dp *activeDataProvider) getTokenIndex() *activeTokenIndex {
+	return &activeTokenIndex{
+		ctx:       dp.ctx,
+		mids:      dp.mids,
+		rids:      dp.rids,
+		tokenList: dp.tokenList,
+		inverser:  dp.getIDsIndex().inverser,
+	}
+}
+
+func (dp *activeDataProvider) Fetch(ids []seq.ID, noSkipMasks bool) ([][]byte, error) {
+	sw := stopwatch.New()
+
+	defer sw.Export(
+		fetcherStagesSeconds,
+		stopwatch.SetLabel("fraction_type", "active"),
+	)
+
+	res := make([][]byte, len(ids))
+
+	indexes := []activeFetchIndex{{
+		docsPositions:    dp.docsPositions,
+		idsToLids:        dp.idsToLids,
+		docsReader:       &dp.docsReader,
+		skipMaskProvider: dp.skipMaskProvider,
+		fracName:         dp.info.Name(),
+	}}
+
+	for _, fi := range indexes {
+		if err := processor.IndexFetch(ids, noSkipMasks, sw, &fi, res); err != nil {
+			return nil, err
+		}
+	}
+
+	return res, nil
+}
+
+func (dp *activeDataProvider) Search(params processor.SearchParams) (*seq.QPR, error) {
+	// The index of the active fraction changes in parts and at a single moment in time may not be consistent.
+	// So we can add new IDs to the index but update the range [from; to] with a delay.
+	// Because of this, at the Search stage, we can get IDs that are outside the fraction range [from; to].
+	//
+	// Because of this, at the next Fetch stage, we may not find documents with such IDs, because we will ignore
+	// the fraction whose range [from; to] does not contain this ID.
+	//
+	// To prevent this from happening, so that the Search stage and the Fetch stage work consistently,
+	// we must limit the query range in accordance with the current fraction range [from; to].
+	params.From = max(params.From, dp.info.From)
+	params.To = min(params.To, dp.info.To)
+
+	aggLimits := processor.AggLimits(dp.config.Search.AggLimits)
+	queryOpt := processor.QueryOptimizationConfig{
+		BatchExecution: processor.BatchExecutionConfig(dp.config.Search.QueryOptimization.BatchExecution),
+		MaterializedColumnAgg: processor.MaterializedColumnAggConfig{
+			Enabled: dp.config.Search.QueryOptimization.MaterializedColumnAgg.Enabled,
+		},
+	}
+
+	sw := stopwatch.New()
+
+	defer sw.Export(
+		fractionSearchMetric(params),
+		stopwatch.SetLabel("fraction_type", "active"),
+	)
+
+	t := sw.Start("total")
+
+	m := sw.Start("new_search_index")
+	indexes := []activeSearchIndex{{
+		activeIDsIndex:   dp.getIDsIndex(),
+		activeTokenIndex: dp.getTokenIndex(),
+		skipMaskProvider: dp.skipMaskProvider,
+		fracName:         dp.info.Name(),
+	}}
+	m.Stop()
+
+	qprs := make([]*seq.QPR, 0, len(indexes))
+
+	for _, si := range indexes {
+		qpr, err := processor.IndexSearch(dp.ctx, dp.info.BinaryDataVer, params, &si, aggLimits, queryOpt, sw)
+		if err != nil {
+			return nil, err
+		}
+		qprs = append(qprs, qpr)
+	}
+
+	res := processor.MergeQPRs(qprs, params)
+	res.IDs.ApplyHint(dp.info.Name())
+	t.Stop()
+
+	return res, nil
+}
+
+func (dp *activeDataProvider) FindLIDs(ids []seq.ID) ([]seq.LID, error) {
+	res := make([]seq.LID, 0, len(ids))
+	for _, id := range ids {
+		if lid, ok := dp.idsToLids.Get(id); ok {
+			res = append(res, lid)
+		}
+	}
+	return res, nil
+}
+
+type activeIDsIndex struct {
+	mids     []uint64
+	rids     []uint64
+	inverser *inverser
+}
+
+func (p *activeIDsIndex) GetMID(lid seq.LID) seq.MID {
+	restoredLID := p.inverser.Revert(uint32(lid))
+	return seq.MID(p.mids[restoredLID])
+}
+
+func (p *activeIDsIndex) GetMIDs(lidsBatch []node.LID, out []seq.MID) []seq.MID {
+	for _, lid := range lidsBatch {
+		out = append(out, p.GetMID(lid.ToSeqLID()))
+	}
+	return out
+}
+
+func (p *activeIDsIndex) GetRID(lid seq.LID) seq.RID {
+	restoredLID := p.inverser.Revert(uint32(lid))
+	return seq.RID(p.rids[restoredLID])
+}
+
+func (p *activeIDsIndex) GetRIDs(lidsBatch []node.LID, out []seq.RID) []seq.RID {
+	for _, lid := range lidsBatch {
+		out = append(out, p.GetRID(lid.ToSeqLID()))
+	}
+	return out
+}
+
+func (p *activeIDsIndex) Len() int {
+	return p.inverser.Len()
+}
+
+func (p *activeIDsIndex) LessOrEqual(lid seq.LID, id seq.ID) bool {
+	checkedMID := p.GetMID(lid)
+	if checkedMID == id.MID {
+		return p.GetRID(lid) <= id.RID
+	}
+	return checkedMID < id.MID
+}
+
+type activeSearchIndex struct {
+	*activeIDsIndex
+	*activeTokenIndex
+	skipMaskProvider skipMaskProvider
+	fracName         string
+}
+
+func (si *activeSearchIndex) GetSkipLIDs(minLID, maxLID uint32, reverse bool) (node.Node, bool, func() error, error) {
+	// active fraction doesn't meet min and max lid
+	minLID, maxLID = uint32(0), uint32(math.MaxUint32)
+
+	iterator, has, release, err := si.skipMaskProvider.GetIDsIteratorByFrac(si.fracName, minLID, maxLID, reverse)
+	if err != nil {
+		return nil, false, release, err
+	}
+
+	res := make([]uint32, 0)
+	for {
+		// traverse iterator to inverse and sort lids
+		lid := iterator.Next()
+		if lid.IsNull() {
+			break
+		}
+		if inversed, ok := si.activeIDsIndex.inverser.Inverse(lid.Unpack()); ok {
+			res = append(res, uint32(inversed))
+		}
+	}
+
+	// we need to sort inversed values since they may be out of order after replay of active fraction
+	slices.Sort(res)
+
+	return node.NewStatic(res, !reverse), has, release, nil
+}
+
+type activeTokenIndex struct {
+	ctx       context.Context
+	mids      *UInt64s
+	rids      *UInt64s
+	tokenList *TokenList
+	inverser  *inverser
+}
+
+func (si *activeTokenIndex) GetValByTID(tid uint32, field string) []byte {
+	return si.tokenList.GetValByTID(tid, field)
+}
+
+func (si *activeTokenIndex) GetTIDsByField(field string) ([]uint32, error) {
+	return si.tokenList.GetTIDsByField(field), nil
+}
+
+func (si *activeTokenIndex) GetTIDsByTokenExpr(t parser.Token) ([]uint32, error) {
+	return si.tokenList.FindPattern(si.ctx, t)
+}
+
+func (si *activeTokenIndex) GetFreqsByTIDs(tids []uint32, field string) []uint32 {
+	return make([]uint32, len(tids))
+}
+
+func (si *activeTokenIndex) GetLIDsFromTIDs(tids []uint32, _ lids.Counter, minLID, maxLID uint32, order seq.DocsOrder) []node.Node {
+	nodes := make([]node.Node, 0, len(tids))
+	for _, tid := range tids {
+		tlids := si.tokenList.Provide(tid)
+		unmapped := tlids.GetLIDs(si.mids, si.rids)
+		inverse := inverseLIDs(unmapped, si.inverser, minLID, maxLID)
+		nodes = append(nodes, node.NewStatic(inverse, order.IsDesc()))
+	}
+	return nodes
+}
+
+func (si *activeTokenIndex) GetBatchedLIDsFromTIDs(tids []uint32, _ lids.Counter, minLID, maxLID uint32, order seq.DocsOrder) []node.BatchedNode {
+	nodes := make([]node.BatchedNode, 0, len(tids))
+	for _, tid := range tids {
+		tlids := si.tokenList.Provide(tid)
+		unmapped := tlids.GetLIDs(si.mids, si.rids)
+		inverse := inverseLIDs(unmapped, si.inverser, minLID, maxLID)
+		nodes = append(nodes, node.NewStaticBatched(inverse, order.IsDesc()))
+	}
+	return nodes
+}
+
+func inverseLIDs(unmapped []uint32, inv *inverser, minLID, maxLID uint32) []uint32 {
+	result := make([]uint32, 0, len(unmapped))
+	for _, v := range unmapped {
+		// we skip those values that are not in the inverser, because such values appeared after the search query started
+		if val, ok := inv.Inverse(v); ok {
+			if minLID <= uint32(val) && uint32(val) <= maxLID {
+				result = append(result, uint32(val))
+			}
+		}
+	}
+	return result
+}
+
+type activeFetchIndex struct {
+	docsPositions    *DocsPositions
+	idsToLids        *ActiveLIDs
+	docsReader       *storage.DocsReader
+	skipMaskProvider skipMaskProvider
+	fracName         string
+}
+
+func (di *activeFetchIndex) GetDocPos(ids []seq.ID, noSkipMasks bool) ([]seq.DocPos, error) {
+	docsPos := make([]seq.DocPos, len(ids))
+	for i, id := range ids {
+		docsPos[i] = di.docsPositions.GetSync(id)
+	}
+
+	if noSkipMasks {
+		return docsPos, nil
+	}
+
+	minLID, maxLID := uint32(0), uint32(math.MaxUint32)
+	skipLIDsBitmap, err := di.skipMaskProvider.GetIDsBitmapByFrac(di.fracName, minLID, maxLID)
+	if err != nil {
+		return nil, err
+	}
+
+	if skipLIDsBitmap == nil {
+		return docsPos, nil
+	}
+
+	allLids := make([]uint32, len(ids))
+	for i, id := range ids {
+		if lid, ok := di.idsToLids.Get(id); ok {
+			allLids[i] = uint32(lid)
+		}
+	}
+
+	for i, lid := range allLids {
+		if skipLIDsBitmap.Contains(uint32(lid)) {
+			docsPos[i] = seq.DocPosNotFound
+		}
+	}
+
+	return docsPos, nil
+}
+
+func (di *activeFetchIndex) ReadDocs(blockIndex uint32, docOffsets []uint64) ([][]byte, error) {
+	return di.docsReader.ReadDocs(blockIndex, docOffsets)
+}

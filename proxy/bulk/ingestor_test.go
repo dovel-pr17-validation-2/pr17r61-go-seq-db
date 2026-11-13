@@ -1,0 +1,595 @@
+package bulk
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/alecthomas/units"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ozontech/seq-db/consts"
+	"github.com/ozontech/seq-db/indexer"
+	"github.com/ozontech/seq-db/mappingprovider"
+	"github.com/ozontech/seq-db/packer"
+	"github.com/ozontech/seq-db/seq"
+	"github.com/ozontech/seq-db/storage"
+	"github.com/ozontech/seq-db/tokenizer"
+)
+
+func TestProcessDocuments(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	mappingProvider, err := mappingprovider.New("", mappingprovider.WithMapping(map[string]seq.MappingTypes{
+		"path":                                  newMapping(seq.TokenizerTypePath),
+		"level":                                 newMapping(seq.TokenizerTypeKeyword),
+		"message":                               newMapping(seq.TokenizerTypeText),
+		"error":                                 newMapping(seq.TokenizerTypeText),
+		"shard":                                 newMapping(seq.TokenizerTypeKeyword),
+		"trace_id":                              newMapping(seq.TokenizerTypeKeyword),
+		"trace_duration":                        newMapping(seq.TokenizerTypeKeyword),
+		"service":                               newMapping(seq.TokenizerTypeKeyword),
+		"tags":                                  newMapping(seq.TokenizerTypeTags),
+		"tags.level":                            newMapping(seq.TokenizerTypeKeyword),
+		"tags.message":                          newMapping(seq.TokenizerTypeText),
+		"tags.path":                             newMapping(seq.TokenizerTypePath),
+		"spans":                                 newMapping(seq.TokenizerTypeNested),
+		"spans.trace_id":                        newMapping(seq.TokenizerTypeKeyword),
+		"spans.span_id":                         newMapping(seq.TokenizerTypeKeyword),
+		"spans.duration":                        newMapping(seq.TokenizerTypeKeyword),
+		"spans.tags":                            newMapping(seq.TokenizerTypeTags),
+		"spans.tags.zone":                       newMapping(seq.TokenizerTypeKeyword),
+		"spans.tags.otel.status_code":           newMapping(seq.TokenizerTypeKeyword),
+		"spans.error_tag":                       newMapping(seq.TokenizerTypeKeyword),
+		"spans.process":                         newMapping(seq.TokenizerTypeObject),
+		"spans.process.service_name":            newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags":                    newMapping(seq.TokenizerTypeTags),
+		"spans.process.tags.app.version":        newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags.k8s.namespace.name": newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags.k8s.label.app":      newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags.k8s.service.name":   newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags.k8s.pod.name":       newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags.k8s.node.name":      newMapping(seq.TokenizerTypeKeyword),
+		"spans.process.tags.k8s.host.name":      newMapping(seq.TokenizerTypeKeyword),
+		"spans.operation_name":                  newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap":                         newMapping(seq.TokenizerTypeObject),
+		"spans.tagsMap.error":                   newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap.ip":                      newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap.span.kind":               newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap.page.type":               newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap.slo.violated":            newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap.http.url":                newMapping(seq.TokenizerTypeKeyword),
+		"spans.tagsMap.http.method":             newMapping(seq.TokenizerTypeKeyword),
+		"spans2":                                newMapping(seq.TokenizerTypeNested),
+		"spans2.span_id":                        newMapping(seq.TokenizerTypeKeyword),
+		"spans2.operation_name":                 newMapping(seq.TokenizerTypeKeyword),
+		"exists_only":                           newMapping(seq.TokenizerTypeExists),
+	}))
+	require.NoError(t, err)
+
+	cfg := IngestorConfig{
+		MaxInflightBulks:       1,
+		AllowedTimeDrift:       time.Hour,
+		FutureAllowedTimeDrift: time.Hour,
+		MappingProvider:        mappingProvider,
+		MaxTokenSize:           int(units.KiB),
+		CaseSensitive:          false,
+		PartialFieldIndexing:   false,
+		DocsZSTDCompressLevel:  -1,
+		MetasZSTDCompressLevel: -1,
+		MaxDocumentSize:        int(units.KiB),
+	}
+
+	now := time.Now().UTC()
+
+	id := seq.SimpleID(now.UnixNano())
+
+	type TestPayload struct {
+		InDocs  []string
+		ExpDocs []string
+		ExpMeta []indexer.MetaData
+	}
+	type TestCase struct {
+		Name    string
+		Payload func() TestPayload
+	}
+
+	var (
+		all       = newToken(seq.TokenAll, "")
+		existsMsg = newToken(seq.TokenExists, "message")
+	)
+
+	tests := []TestCase{
+		{
+			Name: "empty_doc",
+			Payload: func() TestPayload {
+				return TestPayload{
+					InDocs:  []string{"{}"},
+					ExpDocs: nil,
+					ExpMeta: []indexer.MetaData{{
+						ID:     id,
+						Size:   2,
+						Tokens: []tokenizer.MetaToken{newToken(seq.TokenAll, "")},
+					}},
+				}
+			},
+		},
+		{
+			Name: "text_with_asterisks",
+			Payload: func() TestPayload {
+				tk := func(val string) tokenizer.MetaToken {
+					return newToken("message", val)
+				}
+				return TestPayload{
+					InDocs: []string{
+						`{"message":"*prefix_asterisk"}`,
+						`{"message":"* prefix_asterisk"}`,
+
+						`{"message":"infix*asterisk"}`,
+						`{"message":"infix * asterisk"}`,
+						`{"message":"infix *asterisk"}`,
+						`{"message":"infix* asterisk"}`,
+
+						`{"message":"postfix asterisk*"}`,
+						`{"message":"postfix asterisk *"}`,
+					},
+					ExpDocs: nil,
+					ExpMeta: []indexer.MetaData{
+						{ID: id, Size: 30, Tokens: []tokenizer.MetaToken{all, tk("*prefix_asterisk"), existsMsg}},
+						{ID: id, Size: 31, Tokens: []tokenizer.MetaToken{all, tk("*"), tk("prefix_asterisk"), existsMsg}},
+						{ID: id, Size: 28, Tokens: []tokenizer.MetaToken{all, tk("infix*asterisk"), existsMsg}},
+						{ID: id, Size: 30, Tokens: []tokenizer.MetaToken{all, tk("infix"), tk("*"), tk("asterisk"), existsMsg}},
+						{ID: id, Size: 29, Tokens: []tokenizer.MetaToken{all, tk("infix"), tk("*asterisk"), existsMsg}},
+						{ID: id, Size: 29, Tokens: []tokenizer.MetaToken{all, tk("infix*"), tk("asterisk"), existsMsg}},
+						{ID: id, Size: 31, Tokens: []tokenizer.MetaToken{all, tk("postfix"), tk("asterisk*"), existsMsg}},
+						{ID: id, Size: 32, Tokens: []tokenizer.MetaToken{all, tk("postfix"), tk("asterisk"), tk("*"), existsMsg}},
+					},
+				}
+			},
+		},
+		{
+			Name: "exists_field",
+			Payload: func() TestPayload {
+				doc := []string{`{"exists_only": "123"}`}
+				return TestPayload{
+					InDocs:  doc,
+					ExpDocs: doc,
+					ExpMeta: []indexer.MetaData{{
+						ID:   id,
+						Size: 22,
+						Tokens: []tokenizer.MetaToken{
+							newToken(seq.TokenAll, ""),
+							newToken(seq.TokenExists, "exists_only"),
+						},
+					}},
+				}
+			},
+		},
+		{
+			Name: "check_nulls",
+			Payload: func() TestPayload {
+				doc := fmt.Sprintf(`{"tags": [{"key": "level"}, {"key": "message"}, {"key": "path"}], "timestamp": %q}`, now.Format(time.RFC3339Nano))
+				return TestPayload{
+					InDocs:  []string{doc},
+					ExpDocs: []string{doc},
+					ExpMeta: []indexer.MetaData{
+						{ID: id, Size: uint32(len(doc)), Tokens: []tokenizer.MetaToken{
+							newToken(seq.TokenAll, ""),
+							newToken("_exists_", "tags.level"),
+							newToken("_exists_", "tags.message"),
+							newToken("_exists_", "tags.path"),
+						}},
+					},
+				}
+			},
+		},
+		{
+			Name: "too_large_document",
+			Payload: func() TestPayload {
+				doc1 := fmt.Sprintf(`{"level": %q}`, strings.Repeat("a", int(units.KiB)+1))
+				doc2 := fmt.Sprintf(`{"message": %q}`, strings.Repeat("a", int(units.KiB)+1))
+				doc3 := fmt.Sprintf(`{"path": %q}`, strings.Repeat("a", int(units.KiB)+1))
+				return TestPayload{
+					InDocs:  []string{doc1, doc2, doc3},
+					ExpDocs: nil,
+					ExpMeta: []indexer.MetaData{
+						{ID: id, Size: uint32(len(doc1)), Tokens: []tokenizer.MetaToken{newToken(seq.TokenAll, ""), newToken(seq.TokenExists, "level")}},
+						{ID: id, Size: uint32(len(doc2)), Tokens: []tokenizer.MetaToken{newToken(seq.TokenAll, ""), newToken(seq.TokenExists, "message")}},
+						{ID: id, Size: uint32(len(doc3)), Tokens: []tokenizer.MetaToken{newToken(seq.TokenAll, ""), newToken(seq.TokenExists, "path")}},
+					},
+				}
+			},
+		},
+		{
+			Name: "simple_document",
+			Payload: func() TestPayload {
+				const doc = `{"level":"error", "message":" request 🫦 failed! ", "error": "context cancelled", "shard": "1", "path":"http://localhost:8080/example"}`
+				meta := indexer.MetaData{ID: id, Size: uint32(len(doc)), Tokens: []tokenizer.MetaToken{
+					newToken(seq.TokenAll, ""),
+					newToken("level", "error"),
+					newToken(seq.TokenExists, "level"),
+					newToken("message", "request"),
+					newToken("message", "failed"),
+					newToken(seq.TokenExists, "message"),
+					newToken("error", "context"),
+					newToken("error", "cancelled"),
+					newToken(seq.TokenExists, "error"),
+					newToken("shard", "1"),
+					newToken(seq.TokenExists, "shard"),
+					newToken("path", "http:"),
+					newToken("path", "http:/"),
+					newToken("path", "http://localhost:8080"),
+					newToken("path", "http://localhost:8080/example"),
+					newToken(seq.TokenExists, "path"),
+				}}
+
+				return TestPayload{
+					InDocs:  []string{doc, doc, doc},
+					ExpDocs: []string{doc, doc, doc},
+					ExpMeta: []indexer.MetaData{meta, meta, meta},
+				}
+			},
+		},
+		{
+			Name: "tracing",
+			Payload: func() TestPayload {
+				type Tag struct {
+					Key   string `json:"key"`
+					Value string `json:"value,omitempty"`
+				}
+				type TagsMap struct {
+					Error      string `json:"error"`
+					PageType   string `json:"page.type"`
+					SpanKind   string `json:"span.kind"`
+					HTTPURL    string `json:"http.url"`
+					HTTPMethod string `json:"http.method"`
+				}
+				type Process struct {
+					ServiceName string `json:"service_name"`
+					Tags        []Tag  `json:"tags"`
+				}
+				type Reference struct {
+					TraceID string `json:"trace_id"`
+					SpanID  string `json:"span_id"`
+				}
+				type Span struct {
+					TagsMap       TagsMap     `json:"tagsMap"`
+					TraceID       string      `json:"trace_id"`
+					SpanID        string      `json:"span_id"`
+					OperationName string      `json:"operation_name"`
+					References    []Reference `json:"references"`
+					Flags         int64       `json:"flags"`
+					StartTime     time.Time   `json:"start_time"`
+					Duration      int64       `json:"duration"`
+					Tags          []Tag       `json:"tags"`
+					Logs          interface{} `json:"logs"`
+					Process       Process     `json:"process"`
+					Time          string      `json:"time"`
+				}
+				type Trace struct {
+					Spans         []Span `json:"spans"`
+					TraceID       string `json:"trace_id"`
+					TraceDuration int64  `json:"trace_duration"`
+					Timestamp     string `json:"timestamp"`
+					Service       string `json:"service"`
+				}
+				trace := Trace{
+					Spans: []Span{{
+						TagsMap:       TagsMap{Error: "false", PageType: "", SpanKind: "", HTTPURL: "", HTTPMethod: ""},
+						TraceID:       "AAAAAAAAAAAbCmADWEwUBQ==",
+						SpanID:        "IszfJv0zhwU=",
+						OperationName: "memcache: get_multi",
+						References:    []Reference{{TraceID: "AAAAAAAAAAAbCmADWEwUBQ==", SpanID: "bS8caqHI6gU="}},
+						Flags:         4242,
+						StartTime:     time.Date(2024, 9, 24, 14, 10, 14, 2673000, time.UTC),
+						Duration:      4000,
+						Tags:          []Tag{{Key: "zone", Value: "z504"}, {Key: "otel.status_code", Value: "2"}},
+						Logs:          any([]string{`{"time":"2024-09-24T14:10:14.267Z","message": "request failed: context canceled"}`}),
+						Process: Process{
+							ServiceName: "seq-ui-server",
+							Tags: []Tag{
+								{Key: "app.version", Value: "release-s3-10455"},
+								{Key: "k8s.namespace.name", Value: "s3"},
+								{Key: "k8s.label.app", Value: "seq-ui-server"},
+								{Key: "k8s.service.name", Value: "seq-ui-server-34405"},
+								{Key: "k8s.pod.name", Value: "seq-ui-server-34405-z504-65f977fc86-wml9z"},
+								{Key: "k8s.node.name", Value: "10.139.224.142"},
+								{Key: "host.name", Value: "seq-ui-server-34405-z504-65f977fc86-wml9z"},
+							},
+						},
+						Time: now.Format(time.RFC3339),
+					}},
+					TraceID:       "AAAAAAAAAAAbCmADWEwUBQ==",
+					TraceDuration: 137252000,
+					Timestamp:     now.Add(-cfg.AllowedTimeDrift * 6).Format(time.RFC3339Nano),
+					Service:       "seq-ui",
+				}
+
+				inTrace, err := json.Marshal(trace)
+				if err != nil {
+					panic(err)
+				}
+
+				expTrace, err := json.Marshal(trace)
+				if err != nil {
+					panic(err)
+				}
+
+				return TestPayload{
+					InDocs:  []string{string(inTrace)},
+					ExpDocs: []string{string(expTrace)},
+					ExpMeta: []indexer.MetaData{
+						{ID: id, Size: uint32(len(expTrace)), Tokens: buildKeywordTokens(
+							"trace_id", "aaaaaaaaaaabcmadwewubq==",
+							"trace_duration", "137252000",
+							"service", "seq-ui")},
+						{ID: id, Size: 0, Tokens: buildKeywordTokens(
+							"spans.tagsMap.error", "false",
+							"spans.tagsMap.page.type", "",
+							"spans.tagsMap.span.kind", "",
+							"spans.tagsMap.http.url", "",
+							"spans.tagsMap.http.method", "",
+							"spans.trace_id", "aaaaaaaaaaabcmadwewubq==",
+							"spans.span_id", "iszfjv0zhwu=",
+							"spans.operation_name", "memcache: get_multi",
+							"spans.duration", "4000",
+							"spans.tags.zone", "z504",
+							"spans.tags.otel.status_code", "2",
+							"spans.process.service_name", "seq-ui-server",
+							"spans.process.tags.app.version", "release-s3-10455",
+							"spans.process.tags.k8s.namespace.name", "s3",
+							"spans.process.tags.k8s.label.app", "seq-ui-server",
+							"spans.process.tags.k8s.service.name", "seq-ui-server-34405",
+							"spans.process.tags.k8s.pod.name", "seq-ui-server-34405-z504-65f977fc86-wml9z",
+							"spans.process.tags.k8s.node.name", "10.139.224.142",
+							"trace_id", "aaaaaaaaaaabcmadwewubq==",
+							"trace_duration", "137252000",
+							"service", "seq-ui")},
+					},
+				}
+			},
+		},
+		{
+			Name: "multi_nested_fields_and_docs",
+			Payload: func() TestPayload {
+				type Span struct {
+					SpanID string `json:"span_id"`
+					OpName string `json:"operation_name"`
+				}
+				type Nested struct {
+					Spans []Span `json:"spans"`
+					Array []Span `json:"spans2"`
+				}
+				doc := mustMarshalJSON(Nested{
+					Spans: []Span{
+						{SpanID: "1", OpName: "op1"},
+						{SpanID: "2", OpName: "op2"},
+						{SpanID: "3", OpName: "op3"},
+					},
+					Array: []Span{
+						{SpanID: "4", OpName: "op4"},
+						{SpanID: "5", OpName: "op5"},
+						{SpanID: "6", OpName: "op6"},
+					},
+				})
+
+				meta := []indexer.MetaData{
+					{ID: id, Size: uint32(len(doc)), Tokens: buildKeywordTokens()},
+					{ID: id, Size: 0, Tokens: buildKeywordTokens("spans.span_id", "1", "spans.operation_name", "op1")},
+					{ID: id, Size: 0, Tokens: buildKeywordTokens("spans.span_id", "2", "spans.operation_name", "op2")},
+					{ID: id, Size: 0, Tokens: buildKeywordTokens("spans.span_id", "3", "spans.operation_name", "op3")},
+					{ID: id, Size: 0, Tokens: buildKeywordTokens("spans2.span_id", "4", "spans2.operation_name", "op4")},
+					{ID: id, Size: 0, Tokens: buildKeywordTokens("spans2.span_id", "5", "spans2.operation_name", "op5")},
+					{ID: id, Size: 0, Tokens: buildKeywordTokens("spans2.span_id", "6", "spans2.operation_name", "op6")}}
+				return TestPayload{
+					InDocs:  []string{doc, doc, doc},
+					ExpDocs: []string{doc, doc, doc},
+					ExpMeta: slices.Repeat(meta, 3),
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			payload := tc.Payload()
+
+			r := require.New(t)
+			c := &FakeClient{}
+			ingestor := NewIngestor(cfg, c)
+			defer ingestor.Stop()
+
+			inDocs := payload.InDocs
+
+			total, err := ingestor.ProcessDocuments(ctx, now, func() ([]byte, error) {
+				if len(inDocs) == 0 {
+					return nil, nil
+				}
+				doc := []byte(inDocs[0])
+				inDocs = inDocs[1:]
+				return doc, nil
+			})
+
+			r.NoError(err)
+			r.Equal(len(payload.InDocs), total)
+			r.Equal(len(payload.InDocs), c.total)
+
+			binaryDocs, err := storage.DocBlock(c.docs).DecompressTo(nil)
+			require.NoError(t, err)
+
+			docsUnpacker := packer.NewBytesUnpacker(binaryDocs)
+			var gotDocs [][]byte
+			for docsUnpacker.Len() > 0 {
+				gotDocs = append(gotDocs, docsUnpacker.GetBinary())
+			}
+
+			binaryMetas, err := storage.WalBlock(c.metas).DecompressTo(nil)
+			require.NoError(t, err)
+			metasUnpacker := packer.NewBytesUnpacker(binaryMetas)
+			var gotMetas []indexer.MetaData
+			for metasUnpacker.Len() > 0 {
+				meta := indexer.MetaData{}
+				r.NoError(meta.UnmarshalBinary(metasUnpacker.GetBinary()))
+				gotMetas = append(gotMetas, meta)
+			}
+
+			// Assert docs.
+			for i, expDoc := range payload.ExpDocs {
+				r.Equal(expDoc, string(gotDocs[i]))
+			}
+			// Assert metas.
+			r.Equal(len(payload.ExpMeta), len(gotMetas))
+			for i, expMeta := range payload.ExpMeta {
+				gotMetas[i].ID.RID = 0 // Ignore RID because it is random.
+				r.Equalf(expMeta, gotMetas[i], "i=%d:\n got:  %v\n want: %v\n", i, gotMetas[i], payload.ExpMeta[i])
+			}
+		})
+	}
+}
+
+type FakeClient struct {
+	docs  []byte
+	metas []byte
+	total int
+}
+
+func (f *FakeClient) StoreDocuments(_ context.Context, total int, docs, metas []byte) error {
+	f.total = total
+	f.docs = docs
+	f.metas = metas
+	return nil
+}
+
+func BenchmarkProcessDocuments(b *testing.B) {
+	ctx := context.Background()
+
+	mappingProvider, err := mappingprovider.New("", mappingprovider.WithMapping(map[string]seq.MappingTypes{
+		"level":   seq.NewSingleType(seq.TokenizerTypeKeyword, "level", int(units.KiB)),
+		"message": seq.NewSingleType(seq.TokenizerTypeText, "message", int(units.KiB)),
+		"error":   seq.NewSingleType(seq.TokenizerTypeText, "error", int(units.KiB)),
+		"shard":   seq.NewSingleType(seq.TokenizerTypeKeyword, "shard", int(units.KiB)),
+	}))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	cfg := IngestorConfig{
+		MaxInflightBulks:       1,
+		AllowedTimeDrift:       time.Hour * 100,
+		FutureAllowedTimeDrift: time.Hour * 100,
+		MappingProvider:        mappingProvider,
+		CaseSensitive:          false,
+		MaxTokenSize:           int(units.KiB),
+	}
+
+	ingestor := NewIngestor(cfg, &FakeClient{})
+	defer ingestor.Stop()
+	doc := []byte(fmt.Sprintf(`{
+		"level":"error",
+		"timestamp":%q,
+		"message":"невозможно сохранить данные в шарде",
+		"error":"circuit breaker execute: can't receive bulk acceptance:
+			host=***REMOVED***, err=rpc error: code = Unavailable desc = connection error:
+			desc = \"transport: Error while dialing: dial tcp 10.233.140.20:9002: connect: connection refused\"",
+		"shard":0
+	}`, time.Now().Format(consts.ESTimeFormat)))
+
+	const docsToProcess = 1000
+	now := time.Now()
+
+	b.SetBytes(int64(len(doc) * docsToProcess))
+
+	for b.Loop() {
+		n := 0
+		total, err := ingestor.ProcessDocuments(ctx, now, func() ([]byte, error) {
+			n++
+			if n-1 == docsToProcess {
+				return nil, nil
+			}
+			return doc, nil
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if total != docsToProcess {
+			b.Fatal("wrong total", total, docsToProcess)
+		}
+	}
+}
+
+func newMapping(mappingType seq.TokenizerType) seq.MappingTypes {
+	return seq.NewSingleType(mappingType, "", int(units.KiB))
+}
+
+func newToken(k, v string) tokenizer.MetaToken {
+	return tokenizer.MetaToken{
+		Key:   []byte(k),
+		Value: []byte(v),
+	}
+}
+
+func buildKeywordTokens(kvs ...string) []tokenizer.MetaToken {
+	var tokens []tokenizer.MetaToken
+
+	tokens = append(tokens, newToken("_all_", ""))
+
+	for i := 0; i < len(kvs); i += 2 {
+		k := kvs[i]
+		v := kvs[i+1]
+		tokens = append(tokens, newToken(k, v), newToken(seq.TokenExists, k))
+	}
+	return tokens
+}
+
+func mustMarshalJSON(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func TestProcessDocumentType(t *testing.T) {
+	r := require.New(t)
+
+	test := func(doc string, expected int) {
+		t.Helper()
+		client := &FakeClient{}
+		mp, err := mappingprovider.New("", mappingprovider.WithMapping(map[string]seq.MappingTypes{}))
+		r.NoError(err)
+		ingestor := NewIngestor(IngestorConfig{MaxInflightBulks: 1, MappingProvider: mp}, client)
+		defer ingestor.Stop()
+
+		stop := false
+		n, err := ingestor.ProcessDocuments(context.Background(), time.Now(), func() ([]byte, error) {
+			if stop {
+				return nil, nil
+			}
+			stop = true
+			return []byte(doc), nil
+		})
+		r.NoError(err)
+		r.Equal(expected, n)
+		r.Equal(n, client.total)
+		if n != 0 {
+			r.True(len(client.docs) > 0)
+			r.True(len(client.metas) > 0)
+		} else {
+			r.True(len(client.docs) == 0)
+			r.True(len(client.metas) == 0)
+		}
+	}
+
+	test(`{}`, 1)
+	test(`null`, 0)
+	test(`"string"`, 0)
+	test(`42.0`, 0)
+	test(`[{"k":"v"}]`, 0)
+}

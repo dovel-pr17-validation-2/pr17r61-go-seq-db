@@ -1,0 +1,611 @@
+package search
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/ozontech/seq-db/asyncsearcher"
+	"github.com/ozontech/seq-db/config"
+	"github.com/ozontech/seq-db/consts"
+	"github.com/ozontech/seq-db/logger"
+	"github.com/ozontech/seq-db/pkg/storeapi"
+	"github.com/ozontech/seq-db/proxy/stores"
+	"github.com/ozontech/seq-db/seq"
+	"github.com/ozontech/seq-db/util"
+)
+
+type AsyncRequest struct {
+	Retention         time.Duration
+	Query             string
+	From              time.Time
+	To                time.Time
+	Aggregations      []AggQuery
+	HistogramInterval seq.MID
+	WithDocs          bool
+	Size              int64
+}
+
+type AsyncResponse struct {
+	ID string
+}
+
+func (si *Ingestor) StartAsyncSearch(ctx context.Context, r AsyncRequest) (AsyncResponse, error) {
+	requestID := uuid.New().String()
+
+	searchStores, err := si.getAsyncSearchStores()
+	if err != nil {
+		return AsyncResponse{}, err
+	}
+
+	req := storeapi.StartAsyncSearchRequest{
+		SearchId:          requestID,
+		Query:             r.Query,
+		From:              r.From.UnixMilli(),
+		To:                r.To.UnixMilli(),
+		Aggs:              convertToAggsQuery(r.Aggregations),
+		HistogramInterval: int64(seq.MIDToMillis(r.HistogramInterval)),
+		Retention:         durationpb.New(r.Retention),
+		WithDocs:          r.WithDocs,
+		Size:              r.Size,
+	}
+
+	for i, shard := range searchStores.Shards {
+		var err error
+
+		idx := util.IdxShuffle(len(shard))
+		for i := range len(shard) {
+			replica := shard[idx[i]]
+			_, err = si.clients[replica].StartAsyncSearch(ctx, &req)
+			if err != nil {
+				logger.Error("Can't start async search",
+					zap.String("replica", replica), zap.Error(err))
+				continue
+			}
+			break
+		}
+		if err != nil {
+			delErr := si.DeleteAsyncSearch(ctx, requestID)
+			if delErr != nil {
+				logger.Error("unable to clear inconsistent async search creation",
+					zap.String("id", requestID), zap.Error(delErr))
+			}
+			return AsyncResponse{}, fmt.Errorf("starting search in shard=%d: %s", i, err)
+		}
+	}
+
+	return AsyncResponse{ID: requestID}, nil
+}
+
+type FetchAsyncSearchResultRequest struct {
+	ID     string
+	Size   int
+	Offset int
+	Order  seq.DocsOrder
+}
+
+type FetchAsyncSearchResultResponse struct {
+	Status     asyncsearcher.AsyncSearchStatus
+	QPR        seq.QPR
+	CanceledAt time.Time
+	DoneAt     time.Time
+
+	StartedAt time.Time
+	ExpiresAt time.Time
+
+	Progress  float64
+	DiskUsage uint64
+
+	AggResult []seq.AggregationResult
+
+	Request AsyncRequest
+}
+
+type GetAsyncSearchesListRequest struct {
+	Status *asyncsearcher.AsyncSearchStatus
+	Size   int
+	Offset int
+	IDs    []string
+}
+
+type AsyncSearchesListItem struct {
+	ID     string
+	Status asyncsearcher.AsyncSearchStatus
+
+	StartedAt  time.Time
+	ExpiresAt  time.Time
+	CanceledAt time.Time
+	DoneAt     time.Time
+
+	Progress  float64
+	DiskUsage uint64
+
+	Request AsyncRequest
+	Error   error
+}
+
+func (si *Ingestor) FetchAsyncSearchResult(
+	ctx context.Context,
+	r FetchAsyncSearchResultRequest,
+) (FetchAsyncSearchResultResponse, DocsIterator, error) {
+	if r.Size < 0 || r.Offset < 0 {
+		return FetchAsyncSearchResultResponse{}, nil, fmt.Errorf("%w: negative size or offset", consts.ErrInvalidArgument)
+	}
+
+	searchStores, err := si.getAsyncSearchStores()
+	if err != nil {
+		return FetchAsyncSearchResultResponse{}, nil, err
+	}
+
+	req := storeapi.FetchAsyncSearchResultRequest{
+		SearchId: r.ID,
+		Size:     int32(r.Size),
+		Offset:   int32(r.Offset),
+	}
+
+	storesCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type shardResponse struct {
+		replica string
+		data    *storeapi.FetchAsyncSearchResultResponse
+		err     error
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(searchStores.Shards))
+	respChan := make(chan shardResponse, len(searchStores.Shards))
+	for _, shard := range searchStores.Shards {
+		go func(shard []string) {
+			defer wg.Done()
+
+			for _, replica := range shard {
+				var md metadata.MD
+				storeResp, err := si.clients[replica].FetchAsyncSearchResult(
+					storesCtx, &req,
+					grpc.MaxCallRecvMsgSize(config.MaxGrpcMessageSizeBytes),
+					grpc.MaxCallSendMsgSize(config.MaxGrpcMessageSizeBytes),
+					grpc.UseCompressor(gzip.Name),
+					grpc.Header(&md),
+				)
+				if err != nil {
+					if status.Code(err) == codes.NotFound {
+						continue
+					}
+				}
+
+				protocolVersion := config.StoreProtocolVersion1
+				if protocolVersionValues := md.Get(consts.StoreProtocolVersionHeader); len(protocolVersionValues) > 0 {
+					protocolVersion = config.ParseStoreProtocolVersion(protocolVersionValues[0])
+				}
+
+				if protocolVersion == config.StoreProtocolVersion1 && storeResp != nil && storeResp.Response != nil {
+					response := storeResp.Response
+					for _, id := range response.IdSources {
+						id.Id.Mid = uint64(seq.MillisToMID(id.Id.Mid))
+					}
+
+					if len(response.Histogram) > 0 {
+						newHist := make(map[uint64]uint64, len(response.Histogram))
+						for mid, v := range response.Histogram {
+							newHist[uint64(seq.MillisToMID(mid))] = v
+						}
+						response.Histogram = newHist
+					}
+				}
+
+				respChan <- shardResponse{
+					replica: replica,
+					data:    storeResp,
+					err:     err,
+				}
+
+				break
+			}
+		}(shard)
+	}
+
+	go func() {
+		wg.Wait()
+		close(respChan)
+	}()
+
+	intervalsDone := 0
+	intervalsInQueue := 0
+	histInterval := seq.MID(0)
+	pr := FetchAsyncSearchResultResponse{}
+	mergeStoreResp := func(sr *storeapi.FetchAsyncSearchResultResponse, replica string) {
+		pr.DiskUsage += sr.DiskUsage
+		intervalsInQueue += int(sr.IntervalsInQueue)
+		intervalsDone += int(sr.IntervalsDone)
+
+		histInterval = seq.MillisToMID(uint64(sr.HistogramInterval))
+
+		ss := sr.Status.MustAsyncSearchStatus()
+		pr.Status = mergeAsyncSearchStatus(pr.Status, ss)
+
+		for _, errStr := range sr.GetResponse().GetErrors() {
+			pr.QPR.Errors = append(pr.QPR.Errors, seq.ErrorSource{
+				ErrStr: errStr,
+				Source: si.sourceByClient[replica],
+			})
+		}
+
+		t := sr.ExpiresAt.AsTime()
+		if pr.ExpiresAt.IsZero() || pr.ExpiresAt.After(t) {
+			pr.ExpiresAt = t
+		}
+		t = sr.StartedAt.AsTime()
+		if pr.StartedAt.IsZero() || pr.StartedAt.After(t) {
+			pr.StartedAt = t
+		}
+		t = sr.CanceledAt.AsTime()
+		if sr.CanceledAt != nil && (pr.CanceledAt.IsZero() || pr.CanceledAt.After(t)) {
+			pr.CanceledAt = t
+		}
+		t = sr.DoneAt.AsTime()
+		if sr.DoneAt != nil && (pr.DoneAt.IsZero() || pr.DoneAt.Before(t)) {
+			pr.DoneAt = t
+		}
+
+		qpr := responseToQPR(sr.Response, si.sourceByClient[replica], false)
+		seq.MergeQPRs(&pr.QPR, []*seq.QPR{qpr}, r.Size+r.Offset, histInterval, r.Order)
+	}
+
+	var aggQueries []seq.AggregateArgs
+	var searchReq *AsyncRequest
+	var successfulResponses int
+	var errs []error
+
+	for resp := range respChan {
+		if err := resp.err; err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		successfulResponses++
+		storeResp := resp.data
+		mergeStoreResp(storeResp, resp.replica)
+
+		if len(aggQueries) == 0 {
+			for _, agg := range storeResp.Aggs {
+				aggQueries = append(aggQueries, seq.AggregateArgs{
+					Func:      agg.Func.MustAggFunc(),
+					Quantiles: agg.Quantiles,
+				})
+			}
+		}
+
+		if searchReq == nil {
+			searchReq = &AsyncRequest{
+				Retention:         storeResp.Retention.AsDuration(),
+				Query:             storeResp.Query,
+				From:              storeResp.From.AsTime(),
+				To:                storeResp.To.AsTime(),
+				Aggregations:      buildRequestAggs(storeResp.Aggs),
+				HistogramInterval: histInterval,
+				WithDocs:          storeResp.WithDocs,
+				Size:              storeResp.Size,
+			}
+		}
+	}
+
+	combinedErr := util.DeduplicateErrors(errs)
+	if successfulResponses == 0 && combinedErr == nil {
+		return FetchAsyncSearchResultResponse{}, nil, status.Error(codes.NotFound, "async search result not found")
+	}
+	if successfulResponses == 0 && combinedErr != nil {
+		return FetchAsyncSearchResultResponse{}, nil, status.Error(codes.Internal, combinedErr.Error())
+	}
+
+	if intervalsDone != 0 {
+		pr.Progress = float64(intervalsDone) / float64(intervalsDone+intervalsInQueue)
+	}
+	if pr.Status == asyncsearcher.AsyncSearchStatusDone {
+		pr.Progress = 1
+	}
+	pr.AggResult = pr.QPR.Aggregate(aggQueries)
+	pr.Request = *searchReq
+
+	docsStream := DocsIterator(EmptyDocsStream{})
+	var size int
+	pr.QPR.IDs, size = paginateIDs(pr.QPR.IDs, r.Offset, min(r.Size, int(pr.Request.Size)))
+	if size > 0 {
+		fieldsFilter := tryParseFieldsFilter(pr.Request.Query)
+		var err error
+		docsStream, err = si.FetchDocsStream(ctx, pr.QPR.IDs, false, false, fieldsFilter)
+		if err != nil {
+			return pr, nil, err
+		}
+	}
+
+	if combinedErr != nil {
+		return pr, docsStream, fmt.Errorf("%w: %s", consts.ErrPartialResponse, combinedErr)
+	}
+	if successfulResponses != len(searchStores.Shards) {
+		return pr, docsStream, fmt.Errorf("%w: %s", consts.ErrPartialResponse, "search data is missing on some shard")
+	}
+
+	return pr, docsStream, nil
+}
+
+func (si *Ingestor) GetAsyncSearchesList(
+	ctx context.Context,
+	r GetAsyncSearchesListRequest,
+) ([]*AsyncSearchesListItem, error) {
+	if r.Size < 0 || r.Offset < 0 {
+		return nil, fmt.Errorf("%w: negative size or offset", consts.ErrInvalidArgument)
+	}
+
+	searchStores, err := si.getAsyncSearchStores()
+	if err != nil {
+		return nil, err
+	}
+
+	var searchStatus *storeapi.AsyncSearchStatus
+	if r.Status != nil {
+		s := storeapi.MustProtoAsyncSearchStatus(*r.Status)
+		searchStatus = &s
+	}
+	req := storeapi.GetAsyncSearchesListRequest{
+		Status: searchStatus,
+		Ids:    r.IDs,
+	}
+
+	storesCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type shardResponse struct {
+		data *storeapi.GetAsyncSearchesListResponse
+		err  error
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(searchStores.Shards))
+	respChan := make(chan shardResponse, len(searchStores.Shards))
+	for _, shard := range searchStores.Shards {
+		go func(shard []string) {
+			defer wg.Done()
+
+			// we must query all replicas since the required data’s location is unknown in advance
+			for _, replica := range shard {
+				storeResp, err := si.clients[replica].GetAsyncSearchesList(storesCtx, &req)
+				if err != nil {
+					if status.Code(err) == codes.NotFound {
+						continue
+					}
+				}
+
+				respChan <- shardResponse{
+					data: storeResp,
+					err:  err,
+				}
+			}
+		}(shard)
+	}
+
+	go func() {
+		wg.Wait()
+		close(respChan)
+	}()
+
+	responsesByID := make(map[string][]*storeapi.AsyncSearchesListItem)
+
+	var successfulResponses int
+	var errs []error
+	for resp := range respChan {
+		if err := resp.err; err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		successfulResponses++
+		for _, s := range resp.data.Searches {
+			responsesByID[s.SearchId] = append(responsesByID[s.SearchId], s)
+		}
+	}
+
+	combinedErr := util.DeduplicateErrors(errs)
+	if successfulResponses == 0 {
+		return nil, status.Error(codes.Internal, combinedErr.Error())
+	}
+
+	searches := make([]*AsyncSearchesListItem, 0)
+
+	for id, items := range responsesByID {
+		intervalsDone := 0
+		intervalsInQueue := 0
+		storeErrs := make([]error, 0)
+		var searchReq *AsyncRequest
+		search := AsyncSearchesListItem{
+			ID: id,
+		}
+
+		mergeListItem := func(sr *storeapi.AsyncSearchesListItem) {
+			search.DiskUsage += sr.DiskUsage
+			intervalsInQueue += int(sr.IntervalsInQueue)
+			intervalsDone += int(sr.IntervalsDone)
+
+			ss := sr.Status.MustAsyncSearchStatus()
+			search.Status = mergeAsyncSearchStatus(search.Status, ss)
+
+			t := sr.StartedAt.AsTime()
+			if search.StartedAt.IsZero() || search.StartedAt.After(t) {
+				search.StartedAt = t
+			}
+			t = sr.ExpiresAt.AsTime()
+			if search.ExpiresAt.IsZero() || search.ExpiresAt.After(t) {
+				search.ExpiresAt = t
+			}
+			t = sr.CanceledAt.AsTime()
+			if sr.CanceledAt != nil && (search.CanceledAt.IsZero() || search.CanceledAt.After(t)) {
+				search.CanceledAt = t
+			}
+			t = sr.DoneAt.AsTime()
+			if sr.DoneAt != nil && (search.DoneAt.IsZero() || search.DoneAt.Before(t)) {
+				search.DoneAt = t
+			}
+		}
+
+		for _, s := range items {
+			mergeListItem(s)
+
+			if searchReq == nil {
+				searchReq = &AsyncRequest{
+					Retention:         s.Retention.AsDuration(),
+					Query:             s.Query,
+					From:              s.From.AsTime(),
+					To:                s.To.AsTime(),
+					Aggregations:      buildRequestAggs(s.Aggs),
+					HistogramInterval: seq.MillisToMID(uint64(s.HistogramInterval)),
+					WithDocs:          s.WithDocs,
+					Size:              s.Size,
+				}
+			}
+
+			if s.Error != "" {
+				storeErrs = append(storeErrs, errors.New(s.Error))
+			}
+		}
+
+		if intervalsDone != 0 {
+			search.Progress = float64(intervalsDone) / float64(intervalsDone+intervalsInQueue)
+		}
+		if search.Status == asyncsearcher.AsyncSearchStatusDone {
+			search.Progress = 1
+		}
+		search.Request = *searchReq
+		search.Error = util.DeduplicateErrors(storeErrs)
+
+		searches = append(searches, &search)
+	}
+
+	// order by StartedAt DESC
+	sort.Slice(searches, func(i, j int) bool {
+		return searches[i].StartedAt.After(searches[j].StartedAt)
+	})
+
+	// limit offset
+	if r.Offset > 0 {
+		searches = searches[min(r.Offset, len(searches)):]
+	}
+	if r.Size > 0 {
+		searches = searches[:min(r.Size, len(searches))]
+	}
+
+	if combinedErr != nil {
+		return searches, fmt.Errorf("%w: %s", consts.ErrPartialResponse, combinedErr)
+	}
+
+	return searches, nil
+}
+
+func mergeAsyncSearchStatus(a, b asyncsearcher.AsyncSearchStatus) asyncsearcher.AsyncSearchStatus {
+	statusWeight := []asyncsearcher.AsyncSearchStatus{
+		asyncsearcher.AsyncSearchStatusDone:       1,
+		asyncsearcher.AsyncSearchStatusInProgress: 2,
+		asyncsearcher.AsyncSearchStatusCanceled:   3,
+		asyncsearcher.AsyncSearchStatusError:      4,
+	}
+	if statusWeight[a] >= statusWeight[b] {
+		return a
+	}
+	return b
+}
+
+func buildRequestAggs(in []*storeapi.AggQuery) []AggQuery {
+	reqAggs := make([]AggQuery, 0, len(in))
+	for _, agg := range in {
+		reqAggs = append(reqAggs, AggQuery{
+			Field:     agg.Field,
+			GroupBy:   agg.GroupBy,
+			Func:      agg.Func.MustAggFunc(),
+			Quantiles: agg.Quantiles,
+			Interval:  seq.MillisToMID(uint64(agg.Interval)),
+		})
+	}
+	return reqAggs
+}
+
+func (si *Ingestor) CancelAsyncSearch(ctx context.Context, id string) error {
+	searchStores, err := si.getAsyncSearchStores()
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	cancelSearch := func(client storeapi.StoreApiClient) {
+		_, err := client.CancelAsyncSearch(ctx, &storeapi.CancelAsyncSearchRequest{SearchId: id})
+		if err != nil {
+			logger.Error("can't cancel async search", zap.String("id", id), zap.Error(err))
+			lastErr = err
+		}
+	}
+
+	si.visitEachReplica(searchStores, cancelSearch)
+	if lastErr != nil {
+		return fmt.Errorf("unable to cancel async search for all shards in cluster; last err: %w", lastErr)
+	}
+	return nil
+}
+
+func (si *Ingestor) DeleteAsyncSearch(ctx context.Context, id string) error {
+	searchStores, err := si.getAsyncSearchStores()
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	deleteSearch := func(client storeapi.StoreApiClient) {
+		_, err := client.DeleteAsyncSearch(ctx, &storeapi.DeleteAsyncSearchRequest{SearchId: id})
+		if err != nil {
+			logger.Error("can't delete async search", zap.String("id", id), zap.Error(err))
+			lastErr = err
+		}
+	}
+
+	si.visitEachReplica(searchStores, deleteSearch)
+	if lastErr != nil {
+		return fmt.Errorf("unable to delete async search for all shards in cluster; last err: %w", lastErr)
+	}
+	return nil
+}
+
+func (si *Ingestor) visitEachReplica(s *stores.Stores, cb func(client storeapi.StoreApiClient)) {
+	for _, shard := range s.Shards {
+		for _, replica := range shard {
+			client := si.clients[replica]
+			cb(client)
+		}
+	}
+}
+
+func (si *Ingestor) getAsyncSearchStores() (*stores.Stores, error) {
+	var searchStores *stores.Stores
+	// TODO: should we support QueryWantsOldData?
+	rs := si.config.ReadStores
+	hrs := si.config.HotReadStores
+	hs := si.config.HotStores
+	if rs != nil && len(rs.Shards) != 0 {
+		searchStores = rs
+	} else if hrs != nil && len(hrs.Shards) != 0 {
+		searchStores = hrs
+	} else if hs != nil && len(hs.Shards) != 0 {
+		searchStores = hs
+	} else {
+		return nil, fmt.Errorf("can't find store shards in config")
+	}
+	return searchStores, nil
+}

@@ -1,0 +1,148 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # GitHub Actions do not support passing arguments to containers (that are declared in the services section of a job),
+      # but MinIO depends on it (it needs `server` argument at least).
+      # When [this](https://github.com/actions/runner/pull/1152) will be merged we can get rid of this step.
+      - name: Setup MinIO
+        uses: maus007/docker-run-action-fork@v1
+        with:
+          registry: quay.io
+          image: alpine/minio:latest-release
+          options: |
+            --detach
+            --publish 9000:9000
+          run: minio server data
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          GOFLAGS: ${{ matrix.flags }}
+          LOG_LEVEL: error
+        run: go test -short -coverprofile=profile.out -covermode=atomic -coverpkg=./... ./...
+
+      - name: Strip generated files from coverage
+        run: |
+          grep -v -e ".pb.go:" -e ".pb.gw.go:" -e ".mock.go:" -e "/mock/" profile.out > profile.out.clean
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: profile.out.clean
+          if-no-files-found: error
+          retention-days: 1
+
+  upload:
+    runs-on: ubuntu-latest
+    needs:
+      - test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage
+
+      - name: Send coverage
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: profile.out.clean
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          only-new-issues: false
+          args: --timeout 5m
+          # Package/build cache already provided above.
+          #
+          # Disable module cache.
+          skip-pkg-cache: true
+          # Disable build cache.
+          skip-build-cache: true
+
+      - name: Install goimports
+        run: go install golang.org/x/tools/cmd/goimports@v0.42.0
+
+      - name: Check imports order
+        run: |
+          find . \
+            -path './pkg' -prune -o \
+            -type f -name '*.go' \
+            ! -name '*.pb.go' \
+            ! -name '*.pb.gw.go' \
+            ! -name '*_mock.go' \
+            -exec goimports -w -local 'github.com/ozontech/seq-db' {} +
+          if [ -n "$(git status --porcelain)" ]; then
+            echo 'Codebase is not goimports-ed. Please run `make imports`'
+            git --no-pager diff
+            exit 1
+          fi
+
+  check-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download && go mod tidy
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Go generate
+        run: go generate ./...
+
+      - name: Check git diff
+        run: git diff --exit-code
